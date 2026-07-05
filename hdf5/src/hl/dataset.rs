@@ -223,6 +223,8 @@ impl Dataset {
                 if !matches!(d.layout, LayoutClass::Chunked(_)) {
                     return Err("only chunked datasets can be resized".into());
                 }
+                // resizing rearranges the buffer; load deferred bytes first
+                d.materialize()?;
                 for (i, (&nd, m)) in new_dims.iter().zip(&d.maxdims).enumerate() {
                     if let Some(m) = m {
                         if nd > *m {

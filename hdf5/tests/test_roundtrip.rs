@@ -765,3 +765,41 @@ fn szip_filter_roundtrip() {
         "{filters:?}"
     );
 }
+
+#[cfg(feature = "rlx")]
+#[test]
+fn rlx_read_tensor() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("t.h5");
+    {
+        let f = File::create(&path).unwrap();
+        let m = Array2::from_shape_fn((5, 7), |(i, j)| (i * 7 + j) as i16);
+        f.new_dataset_builder().with_data(&m).create("m").unwrap();
+        f.new_dataset_builder()
+            .with_data(&Array1::from_shape_fn(9, |i| i as f64))
+            .chunk((3,))
+            .deflate(1)
+            .create("v")
+            .unwrap();
+        let s = f.new_dataset::<i32>().create("s").unwrap();
+        s.write_scalar(&42).unwrap();
+    }
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("m").unwrap().read_tensor().unwrap().dims(),
+        vec![5, 7]
+    );
+    assert_eq!(
+        f.dataset("v").unwrap().read_tensor().unwrap().dims(),
+        vec![9]
+    );
+    assert!(f.dataset("s").unwrap().read_tensor().is_ok());
+    // non-numeric types refuse loudly
+    let strs: Vec<hdf5::types::VarLenUnicode> = vec!["x".parse().unwrap()];
+    let fw = File::open_rw(&path).unwrap();
+    fw.new_dataset_builder()
+        .with_data(&strs)
+        .create("words")
+        .unwrap();
+    assert!(fw.dataset("words").unwrap().read_tensor().is_err());
+}

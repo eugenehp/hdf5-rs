@@ -21,8 +21,8 @@ libc = "0.2"
 num-complex = { version = "0.4", default-features = false }
 # internal
 hdf5-no-c = { version = "0.1.0", path = "hdf5" }
-hdf5-derive = { version = "0.1.0", path = "hdf5-derive" }
-hdf5-types = { version = "0.1.0", path = "hdf5-types" }
+hdf5-no-c-derive = { version = "0.1.0", path = "hdf5-derive" }
+hdf5-no-c-types = { version = "0.1.0", path = "hdf5-types" }
 
 [profile.release]
 opt-level = 3

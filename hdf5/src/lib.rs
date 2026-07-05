@@ -30,6 +30,9 @@
 //! - `szip` — pure-Rust SZip (extended-Rice) codec, validated against libaec.
 //! - `mpi` — SPMD collective files over a built-in TCP mini-MPI
 //!   ([`mpi::Comm`]); not wire-compatible with OpenMPI/MPICH.
+//! - `rlx` — [`Container::read_tensor`](crate::Container::read_tensor):
+//!   load datasets/attributes directly as `rlx` tensors, compose ops
+//!   lazily, and run them on RLX's bundled cpu backend (`to_vec`).
 //! - `complex` — complex-number datatypes via `num-complex`.
 //! - `f16` — half-precision floats via `half`.
 

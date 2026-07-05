@@ -27,10 +27,14 @@ zlib = []
 szip = []
 # Enable the pure-Rust MPI subset (SPMD collective files over TCP).
 mpi = []
+# Load datasets/attributes directly as RLX tensors (`Container::read_tensor`).
+rlx = ["dep:rlx"]
+# `rlx` already includes host evaluation: RLX's default `cpu` backend
+# enables `rlx-tensor/eval`, so `Tensor::to_vec` works out of the box.
 # Enable complex number type support.
-complex = ["hdf5-types/complex"]
+complex = ["hdf5-no-c-types/complex"]
 # Enable float16 type support.
-f16 = ["hdf5-types/f16", "dep:half"]
+f16 = ["hdf5-no-c-types/f16", "dep:half"]
 
 [dependencies]
 # external
@@ -44,10 +48,11 @@ lz4_flex = { version = "0.11", default-features = false, features = ["safe-encod
 snap = "1.1"
 ruzstd = "0.7"
 memmap2 = "0.9"
+rlx = { version = "0.2.10", features = ["tensor"], optional = true }
 half = { workspace = true, optional = true }
 # internal
-hdf5-derive = { workspace = true }
-hdf5-types = { workspace = true }
+hdf5-no-c-derive = { workspace = true }
+hdf5-no-c-types = { workspace = true }
 
 [dev-dependencies]
 half = { workspace = true }
@@ -72,3 +77,11 @@ required-features = ["szip"]
 [[example]]
 name = "mpi_demo"
 required-features = ["mpi"]
+
+[[example]]
+name = "rlx_tensor"
+required-features = ["rlx"]
+
+[[example]]
+name = "rlx_mlp"
+required-features = ["rlx"]

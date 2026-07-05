@@ -1,3 +1,5 @@
+//! Compound (struct) and enum datatypes via `#[derive(H5Type)]`,
+//! plus soft links.
 use hdf5::{File, H5Type};
 
 #[derive(H5Type, Clone, PartialEq, Debug)]
@@ -16,7 +18,8 @@ pub struct Pixel {
 }
 
 fn main() -> hdf5::Result<()> {
-    let path = "/private/tmp/claude-501/-Users-Shared-hdf5-rs/0ebd41ce-ec10-4ac9-9239-8cf4acc80aa8/scratchpad/rust_compound.h5";
+    let path = std::env::temp_dir().join("rust_compound.h5");
+    let path = path.to_str().unwrap();
     {
         let file = File::create(path)?;
         let group = file.create_group("dir")?;

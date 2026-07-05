@@ -1,5 +1,5 @@
 [package]
-name = "hdf5-types"
+name = "hdf5-no-c-types"
 description = "Native Rust equivalents of HDF5 types (pure-Rust port)."
 readme = "README.md"
 categories = ["encoding"]
@@ -11,6 +11,12 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 edition.workspace = true
+
+[lib]
+# published as `hdf5-no-c-types`; the library keeps the `hdf5_types` crate
+# name so `use hdf5_types::...` code compiles unchanged
+name = "hdf5_types"
+path = "src/lib.rs"
 
 [features]
 default = []

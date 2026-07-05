@@ -40,15 +40,62 @@ impl std::fmt::Debug for FileImage {
     }
 }
 
-/// Deferred dataset bytes: a slice of the file image, loaded on first access
-/// so opening a file does not copy every dataset into memory.
+/// Deferred dataset bytes: references into the file image, loaded on first
+/// access so opening a file costs metadata only.
 #[derive(Clone, Debug)]
 pub struct LazyData {
     pub image: std::sync::Arc<FileImage>,
-    pub offset: usize,
-    pub len: usize,
-    /// Logical size (>= len; trailing bytes are zero-filled).
+    /// File base address (superblock offset).
+    pub base: u64,
+    /// Logical dataset size in bytes (output buffer size).
     pub logical: usize,
+    pub kind: LazyKind,
+}
+
+/// What must be done to materialize the deferred bytes.
+#[derive(Clone, Debug)]
+pub enum LazyKind {
+    /// One contiguous run: `image[offset..offset + len]`, zero-padded to
+    /// `logical`.
+    Contiguous { offset: usize, len: usize },
+    /// Chunked storage: every chunk is decoded through the filter pipeline
+    /// and scattered into place on first access.
+    Chunked {
+        /// (chunk offsets, stored size, filter mask, address) per chunk.
+        chunks: Vec<(Vec<u64>, u32, u32, u64)>,
+        dims: Vec<u64>,
+        chunk_dims: Vec<u64>,
+        elem_size: usize,
+        filters: Vec<crate::format::filters::RawFilter>,
+    },
+}
+
+impl LazyData {
+    /// Load the deferred bytes into a fresh logical buffer.
+    pub fn materialize_bytes(&self) -> crate::error::Result<Vec<u8>> {
+        let data: &[u8] = &self.image;
+        match &self.kind {
+            LazyKind::Contiguous { offset, len } => {
+                let mut v = Vec::with_capacity(self.logical);
+                v.extend_from_slice(&data[*offset..*offset + *len]);
+                v.resize(self.logical, 0);
+                Ok(v)
+            }
+            LazyKind::Chunked {
+                chunks,
+                dims,
+                chunk_dims,
+                elem_size,
+                filters,
+            } => {
+                let mut out = vec![0u8; self.logical];
+                crate::format::reader::materialize_chunks(
+                    data, self.base, chunks, dims, chunk_dims, *elem_size, filters, &mut out,
+                )?;
+                Ok(out)
+            }
+        }
+    }
 }
 
 /// Data-layout class of a dataset.
@@ -135,14 +182,19 @@ pub struct DatasetData {
 }
 
 impl DatasetData {
-    /// Copy lazily-referenced bytes out of the file image.
-    pub fn materialize(&mut self) {
+    /// Copy lazily-referenced bytes out of the file image. Decoding errors
+    /// surface on first access, matching libhdf5's read-time error behavior.
+    pub fn materialize(&mut self) -> crate::error::Result<()> {
         if let Some(l) = self.lazy.take() {
-            let mut v = Vec::with_capacity(l.logical);
-            v.extend_from_slice(&l.image[l.offset..l.offset + l.len]);
-            v.resize(l.logical, 0);
-            self.data = v;
+            match l.materialize_bytes() {
+                Ok(v) => self.data = v,
+                Err(e) => {
+                    self.lazy = Some(l); // stay lazy so a retry is possible
+                    return Err(e);
+                }
+            }
         }
+        Ok(())
     }
 
     pub fn extents(&self) -> Extents {
@@ -401,12 +453,13 @@ impl FileState {
     }
 
     /// Materialize every lazy dataset (required before serialization).
-    pub fn materialize_all(&mut self) {
+    pub fn materialize_all(&mut self) -> crate::error::Result<()> {
         for slot in self.objects.iter_mut().flatten() {
             if let ObjectKind::Dataset(d) = &mut slot.kind {
-                d.materialize();
+                d.materialize()?;
             }
         }
+        Ok(())
     }
 
     /// Recompute hard-link reference counts across the arena.

@@ -1,7 +1,7 @@
 [package]
-name = "hdf5-derive"
+name = "hdf5-no-c-derive"
 description = "Derive macro for HDF5 structs and enums (pure-Rust port)."
-categories = ["procedural-macro-helpers"]
+categories = ["development-tools::procedural-macro-helpers"]
 readme = "README.md"
 version.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,7 @@ homepage.workspace = true
 edition.workspace = true
 
 [lib]
+name = "hdf5_derive"
 proc-macro = true
 
 [dependencies]
@@ -23,4 +24,6 @@ syn = { version = "2.0", features = ["derive", "extra-traits"] }
 
 [dev-dependencies]
 trybuild = "1.0"
-hdf5-no-c.workspace = true
+# path-only (no version): stripped from the published manifest, which breaks
+# the dev-dependency cycle hdf5-no-c -> hdf5-no-c-derive -> hdf5-no-c
+hdf5-no-c = { path = "../hdf5" }

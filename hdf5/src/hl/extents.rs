@@ -682,7 +682,7 @@ pub mod tests {
 
         let e = Extents::null();
         assert_eq!(e.ndim(), 0);
-        assert_eq!(e.dims(), vec![]);
+        assert_eq!(e.dims(), Vec::<usize>::new());
         assert_eq!(e.size(), 0);
         assert!(!e.is_scalar());
         assert!(e.is_null());
@@ -691,7 +691,7 @@ pub mod tests {
 
         let e = Extents::scalar();
         assert_eq!(e.ndim(), 0);
-        assert_eq!(e.dims(), vec![]);
+        assert_eq!(e.dims(), Vec::<usize>::new());
         assert_eq!(e.size(), 1);
         assert!(e.is_scalar());
         assert!(!e.is_null());

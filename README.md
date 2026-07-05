@@ -51,17 +51,46 @@ fn main() -> hdf5::Result<()> {
 | Crate | Role |
 |---|---|
 | `hdf5-no-c` (lib name `hdf5`, folder `hdf5/`) | High-level API (drop-in surface of the FFI crate) + the pure-Rust format engine |
-| `hdf5-types` | Native Rust equivalents of HDF5 types (`H5Type`, `TypeDescriptor`, vlen/fixed strings & arrays, dynamic values) |
-| `hdf5-derive` | `#[derive(H5Type)]` for structs, tuple structs and enums |
+| `hdf5-no-c-types` (lib name `hdf5_types`, folder `hdf5-types/`) | Native Rust equivalents of HDF5 types (`H5Type`, `TypeDescriptor`, vlen/fixed strings & arrays, dynamic values) |
+| `hdf5-no-c-derive` (lib name `hdf5_derive`, folder `hdf5-derive/`) | `#[derive(H5Type)]` for structs, tuple structs and enums |
+
+All three packages carry the `-no-c` prefix on crates.io (the unprefixed
+names are taken by the FFI project), while every **library** keeps its
+original crate name — imports and derive output compile unchanged.
 
 ## Examples
+
+Getting started:
 
 ```bash
 cargo run --example quickstart   # typed datasets, groups, attributes
 cargo run --example tour         # chunking+compression, resizing, slicing, links, vlen
-cargo run --example corpus -- <dir>          # read a real-world file corpus
-cargo run --features szip --example szval -- <dir>   # szip codec validation
-cargo run --features mpi  --example mpi_demo # 4 processes, one shared file
+```
+
+Feature deep-dives (each self-contained): `compound`, `vlen`, `denseattr`,
+`advanced_filters` (scaleoffset/nbit/bit-shuffle/zstd + dense links),
+`sohm_vds_write` (shared-message tables + virtual datasets), `userblock`.
+
+With feature flags:
+
+```bash
+cargo run --features rlx  --example rlx_tensor # datasets straight into RLX tensors
+cargo run --features rlx  --example rlx_mlp    # HDF5 checkpoint -> RLX forward pass
+cargo run --features mpi  --example mpi_demo   # 4 processes, one shared file
+cargo run --features szip --example szval -- <dir>  # szip codec validation
+```
+
+Validation tooling: `corpus -- <dir>` (real-world file sweep), `fuzz -- <dir>`
+(mutation fuzzing), `interop_harness` (bidirectional h5py verification).
+
+### HDF5 → RLX in five lines
+
+```rust
+let f = hdf5::File::open("model.h5")?;
+let w1 = f.dataset("model/w1")?.read_tensor()?;   // any numeric dtype -> f32
+let w2 = f.dataset("model/w2")?.read_tensor()?;   // chunked/compressed is fine
+let y = x.matmul(&w1).relu().matmul(&w2);          // symbolic graph, fuses
+let out = y.to_vec();                              // compiled forward pass
 ```
 
 ## Cargo features
@@ -71,6 +100,7 @@ cargo run --features mpi  --example mpi_demo # 4 processes, one shared file
 | *(default)* | Full read/write engine; DEFLATE, shuffle, fletcher32, LZF, blosc, scale-offset, n-bit filters |
 | `szip` | Pure-Rust SZip (extended-Rice/CCSDS 121.0) codec, validated against libaec |
 | `mpi` | SPMD collective files over a built-in TCP mini-MPI (`hdf5::mpi`) — one shared physical file written by N Rust processes; not wire-compatible with OpenMPI |
+| `rlx` | `Container::read_tensor()` — load any numeric dataset/attribute directly as an [RLX](https://crates.io/crates/rlx) tensor (`rlx@0.2.10`). Ops compose lazily, fuse, and run on RLX's bundled cpu backend — HDF5 checkpoints feed straight into inference (see `examples/rlx_mlp.rs`) |
 | `complex` | Complex-number datatypes (`num-complex`) |
 | `f16` | Half-precision floats (`half`) |
 
@@ -233,10 +263,11 @@ python3 interop/check_h5py.py verify /tmp/interop
 - **ScaleOffset and N-bit encoding** (libhdf5-verified chunk formats),
   **bit-shuffle** in blosc (both directions), **dense-link writing** for
   large link-message groups, **filtered fractal heap** reading.
-- **Memory-mapped, lazily-loaded files**: `File::open` maps the file and
-  contiguous unfiltered datasets stay as references into the map until first
-  accessed — opening huge files is metadata-cost only, and reads of untouched
-  datasets never enter memory. (Writes still assemble the file in memory.)
+- **Memory-mapped, metadata-only opens**: `File::open` maps the file; both
+  contiguous *and chunked/filtered* datasets stay as lazy references (the
+  chunk list is collected at parse, decoding happens on first access) —
+  opening huge files costs metadata only, and untouched datasets never enter
+  memory or run their filters. (Writes still assemble the file in memory.)
 
 ## License
 

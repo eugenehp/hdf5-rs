@@ -92,7 +92,7 @@ impl Container {
                     if needs {
                         let mut state = file.state.write();
                         if let crate::model::ObjectKind::Dataset(d) = &mut state.get_mut(*id).kind {
-                            d.materialize();
+                            d.materialize()?;
                         }
                     }
                 }
@@ -218,7 +218,12 @@ impl Container {
                 return d
                     .lazy
                     .as_ref()
-                    .map(|l| l.len as u64)
+                    .map(|l| match &l.kind {
+                        crate::model::LazyKind::Contiguous { len, .. } => *len as u64,
+                        crate::model::LazyKind::Chunked { chunks, .. } => {
+                            chunks.iter().map(|(_, size, _, _)| u64::from(*size)).sum()
+                        }
+                    })
                     .unwrap_or(d.data.len() as u64);
             }
         }
@@ -283,6 +288,36 @@ impl Container {
     /// Alias for [`Container::shape`] (parity with the FFI crate).
     pub fn get_shape(&self) -> Result<Vec<usize>> {
         Ok(self.shape())
+    }
+
+    /// Reads the container as an [`rlx`] tensor (feature `rlx`).
+    ///
+    /// Numeric data of any width converts to `f32` host data via the same
+    /// checked conversion rules as [`Container::read_raw`]; the tensor's
+    /// shape mirrors the dataspace. Non-numeric datatypes are an error.
+    ///
+    /// The returned tensor is an RLX graph constant: further ops compose
+    /// lazily and fuse at materialization, so HDF5 checkpoints feed directly
+    /// into inference —
+    ///
+    /// ```ignore
+    /// let w1 = file.dataset("model/w1")?.read_tensor()?;
+    /// let w2 = file.dataset("model/w2")?.read_tensor()?;
+    /// let y = x.matmul(&w1).relu().matmul(&w2);
+    /// let out = y.to_vec(); // compiles + runs on RLX's cpu backend
+    /// ```
+    ///
+    /// See `examples/rlx_tensor.rs` and `examples/rlx_mlp.rs`.
+    #[cfg(feature = "rlx")]
+    pub fn read_tensor(&self) -> Result<rlx::tensor::Tensor> {
+        use hdf5_types::TypeDescriptor as TD;
+        match self.dtype()?.to_descriptor()? {
+            TD::Integer(_) | TD::Unsigned(_) | TD::Float(_) | TD::Boolean | TD::Enum(_) => {}
+            other => return Err(format!("read_tensor: {other} is not a numeric datatype").into()),
+        }
+        let shape: Vec<usize> = self.shape();
+        let data: Vec<f32> = self.read_raw()?;
+        Ok(rlx::tensor::Tensor::from_vec(data, shape))
     }
 
     /// Reads the raw element bytes in file layout (little-endian, packed).

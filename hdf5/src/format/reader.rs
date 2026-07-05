@@ -340,10 +340,7 @@ impl<'a> Parser<'a> {
                 if !order.is_none() {
                     // byte-swapped data needs the eager postprocess below
                     if let Some(l) = lazy.take() {
-                        let mut v = Vec::with_capacity((l.logical).min(1 << 16));
-                        v.extend_from_slice(&l.image[l.offset..l.offset + l.len]);
-                        v.resize(l.logical, 0);
-                        data = v;
+                        data = l.materialize_bytes()?;
                     }
                 }
                 // Normalize big-endian data to little-endian.
@@ -404,7 +401,7 @@ impl<'a> Parser<'a> {
             let blob = self.read_gheap_object(gh_addr, gh_idx)?;
             let mappings = super::vds::parse_vds_blob(&blob)?;
             if let ObjectKind::Dataset(dd) = &mut self.state.get_mut(obj).kind {
-                dd.materialize();
+                dd.materialize()?;
             }
             let (dims, esize, mut data, fill) = {
                 let d = self
@@ -432,7 +429,7 @@ impl<'a> Parser<'a> {
                     let root = self.state.root;
                     if let Some(id) = self.state.resolve(root, &m.source_dset) {
                         if let ObjectKind::Dataset(dd) = &mut self.state.get_mut(id).kind {
-                            dd.materialize();
+                            dd.materialize()?;
                         }
                     }
                     self.state
@@ -452,7 +449,7 @@ impl<'a> Parser<'a> {
                         })?;
                         let img = std::sync::Arc::new(crate::model::FileImage::Bytes(bytes));
                         let mut st = parse_depth(&img, path.parent(), self.depth + 1)?;
-                        st.materialize_all();
+                        st.materialize_all()?;
                         src_cache.insert(m.source_file.clone(), st);
                     }
                     let st = &src_cache[&m.source_file];
@@ -1119,9 +1116,12 @@ impl<'a> Parser<'a> {
                         // defer the copy: reference the file image directly
                         self.pending_lazy = Some(crate::model::LazyData {
                             image: self.image.clone(),
-                            offset: start,
-                            len: n,
+                            base: self.base,
                             logical: logical_size,
+                            kind: crate::model::LazyKind::Contiguous {
+                                offset: start,
+                                len: n,
+                            },
                         });
                         (LayoutClass::Contiguous, Vec::new())
                     } else {
@@ -1345,25 +1345,35 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        for (offsets, size, mask, addr) in chunks {
-            let start = self.addr(addr);
-            if start + size as usize > self.data.len() {
-                return Err("chunk data out of bounds".into());
-            }
-            let stored = &self.data[start..start + size as usize];
-            let plain = if raw_filters.is_empty() {
-                stored.to_vec()
-            } else {
-                filt::reverse_masked(raw_filters, elem_size, stored, mask)?
-            };
-            let mut chunk = plain;
-            if chunk_bytes > (1 << 33) {
-                return Err("chunk too large".into());
-            }
-            chunk.resize(chunk_bytes, 0);
-            scatter_chunk(&chunk, dims, chunk_dims, &offsets[..rank], elem_size, out);
+        // Defer the decode: keep only the chunk list (metadata) and load on
+        // first access. NBit stays eager (post-decode sign extension happens
+        // in the parser).
+        let has_nbit = raw_filters.iter().any(|f| f.id == filt::FILTER_NBIT);
+        if !has_nbit {
+            self.pending_lazy = Some(crate::model::LazyData {
+                image: self.image.clone(),
+                base: self.base,
+                logical: out.len(),
+                kind: crate::model::LazyKind::Chunked {
+                    chunks,
+                    dims: dims.to_vec(),
+                    chunk_dims: chunk_dims.to_vec(),
+                    elem_size,
+                    filters: raw_filters.to_vec(),
+                },
+            });
+            return Ok(());
         }
-        Ok(())
+        materialize_chunks(
+            self.data,
+            self.base,
+            &chunks,
+            dims,
+            chunk_dims,
+            elem_size,
+            raw_filters,
+            out,
+        )
     }
 
     /// Parse a Fixed Array chunk index (FAHD header + FADB data block),
@@ -1957,6 +1967,45 @@ fn parse_filter_pipeline(c: &mut Cursor) -> Result<Vec<filt::RawFilter>> {
         filters.push(filt::RawFilter { id, cdata, name });
     }
     Ok(filters)
+}
+
+/// Decode and scatter a chunk list into a logical dataset buffer. Shared by
+/// the eager parse path and lazy materialization ([`crate::model::LazyData`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_chunks(
+    data: &[u8],
+    base: u64,
+    chunks: &[(Vec<u64>, u32, u32, u64)],
+    dims: &[u64],
+    chunk_dims: &[u64],
+    elem_size: usize,
+    raw_filters: &[filt::RawFilter],
+    out: &mut [u8],
+) -> Result<()> {
+    let rank = dims.len();
+    let chunk_elems: usize = chunk_dims.iter().map(|&c| c as usize).product();
+    let chunk_bytes = chunk_elems * elem_size;
+    if chunk_bytes > (1 << 33) {
+        return Err("chunk too large".into());
+    }
+    for (offsets, size, mask, addr) in chunks {
+        let start = (base + addr) as usize;
+        if start
+            .checked_add(*size as usize)
+            .is_none_or(|e| e > data.len())
+        {
+            return Err("chunk data out of bounds".into());
+        }
+        let stored = &data[start..start + *size as usize];
+        let mut chunk = if raw_filters.is_empty() {
+            stored.to_vec()
+        } else {
+            filt::reverse_masked(raw_filters, elem_size, stored, *mask)?
+        };
+        chunk.resize(chunk_bytes, 0);
+        scatter_chunk(&chunk, dims, chunk_dims, &offsets[..rank], elem_size, out);
+    }
+    Ok(())
 }
 
 /// Copy one chunk's elements into the row-major logical array.

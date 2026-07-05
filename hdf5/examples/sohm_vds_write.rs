@@ -1,3 +1,5 @@
+//! Regression example: SOHM (shared-message) writing and virtual-dataset
+//! writing, both verified readable by h5py in the interop harness.
 use hdf5::plist::file_create::{SharedMessageIndex, SharedMessageType};
 use hdf5::{File, H5Type};
 use ndarray::Array1;
@@ -14,7 +16,7 @@ struct Wide {
 }
 
 fn main() -> hdf5::Result<()> {
-    let d = "/private/tmp/claude-501/-Users-Shared-hdf5-rs/0ebd41ce-ec10-4ac9-9239-8cf4acc80aa8/scratchpad";
+    let d = std::env::temp_dir().display().to_string();
     // 1. SOHM writing: shared dtype+dataspace messages across 6 datasets
     let p1 = format!("{d}/rust_sohm.h5");
     {

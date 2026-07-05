@@ -1,9 +1,15 @@
+//! Write a szip-compressed file (feature = szip) for external validation.
 use hdf5::filters::{Filter, SZip};
 use hdf5::File;
 use ndarray::Array1;
 
 fn main() -> hdf5::Result<()> {
-    let f = File::create("/private/tmp/claude-501/-Users-Shared-hdf5-rs/0ebd41ce-ec10-4ac9-9239-8cf4acc80aa8/scratchpad/rust_szip.h5")?;
+    let f = File::create(std::env::args().nth(1).unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("rust_szip.h5")
+            .display()
+            .to_string()
+    }))?;
     let data = Array1::from_shape_fn(4000, |i| (i as i32) % 977);
     f.new_dataset_builder()
         .with_data(&data)

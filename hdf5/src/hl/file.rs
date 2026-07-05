@@ -121,7 +121,9 @@ impl File {
         match self.inner() {
             Ok(inner) => {
                 let mut state = inner.state.write();
-                state.materialize_all();
+                if state.materialize_all().is_err() {
+                    return 0;
+                }
                 format::serialize(&state)
                     .map(|b| b.len() as u64)
                     .unwrap_or(0)
@@ -160,7 +162,7 @@ impl File {
         if state.read_only {
             return Ok(());
         }
-        state.materialize_all();
+        state.materialize_all()?;
         let path = inner.path.as_ref().ok_or("file has no backing path")?;
         let bytes = format::serialize(&state)?;
         fs::write(path, bytes)?;
@@ -181,7 +183,7 @@ impl File {
                 let comm = mpi.comm.clone();
                 *guard = None; // detach so flush()/Drop stay local no-ops
                 if write {
-                    state.materialize_all();
+                    state.materialize_all()?;
                     let path = inner.path.as_ref().ok_or("file has no backing path")?;
                     let bytes = format::serialize(&state)?;
                     fs::write(path, bytes)?;
@@ -261,7 +263,9 @@ impl Drop for File {
             // flush whenever a File handle is dropped and the file is writable.
             let mut state = inner.state.write();
             if !state.read_only {
-                state.materialize_all();
+                if state.materialize_all().is_err() {
+                    return; // cannot load deferred bytes; leave the file as-is
+                }
                 if let Some(path) = inner.path.as_ref() {
                     if let Ok(bytes) = format::serialize(&state) {
                         let _ = fs::write(path, bytes);

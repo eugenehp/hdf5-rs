@@ -1,8 +1,10 @@
+//! Basic roundtrip: groups, datasets, attributes, links.
 use hdf5::File;
 use ndarray::arr2;
 
 fn main() -> hdf5::Result<()> {
-    let path = "/private/tmp/claude-501/-Users-Shared-hdf5-rs/0ebd41ce-ec10-4ac9-9239-8cf4acc80aa8/scratchpad/rust_out.h5";
+    let path = std::env::temp_dir().join("rust_out.h5");
+    let path = path.to_str().unwrap();
     {
         let file = File::create(path)?;
         let g = file.create_group("grp")?;

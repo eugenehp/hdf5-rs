@@ -1,8 +1,10 @@
+//! Dense attribute storage: attributes above the 64 KB compact limit
+//! (fractal heap + v2 B-tree, v2 object header).
 use hdf5::File;
 use ndarray::Array1;
 
 fn main() -> hdf5::Result<()> {
-    let d = "/private/tmp/claude-501/-Users-Shared-hdf5-rs/0ebd41ce-ec10-4ac9-9239-8cf4acc80aa8/scratchpad";
+    let d = std::env::temp_dir().display().to_string();
     let path = format!("{d}/rust_denseattr.h5");
     {
         let f = File::create(&path)?;

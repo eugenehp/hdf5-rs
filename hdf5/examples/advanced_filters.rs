@@ -1,9 +1,11 @@
+//! Regression example: scaleoffset/nbit/bit-shuffle/zstd filters and
+//! dense-link groups, written by this crate and read back.
 use hdf5::filters::{Blosc, BloscShuffle, Filter, ScaleOffset};
 use hdf5::File;
 use ndarray::Array1;
 
 fn main() -> hdf5::Result<()> {
-    let d = "/private/tmp/claude-501/-Users-Shared-hdf5-rs/0ebd41ce-ec10-4ac9-9239-8cf4acc80aa8/scratchpad";
+    let d = std::env::temp_dir().display().to_string();
     let path = format!("{d}/rust_round6a.h5");
     {
         let f = File::create(&path)?;

@@ -459,7 +459,7 @@ impl MpiFile {
             self.log.clear();
             return Ok(false);
         }
-        state.materialize_all();
+        state.materialize_all()?;
         for (rank, blob) in gathered.unwrap().into_iter().enumerate() {
             // rank 0's own writes are already in its model
             if rank == 0 {
@@ -472,7 +472,7 @@ impl MpiFile {
                 let crate::model::ObjectKind::Dataset(d) = &mut state.get_mut(id).kind else {
                     return Err(format!("MPI merge: {} is not a dataset", e.path).into());
                 };
-                d.materialize();
+                d.materialize()?;
                 let mut src = 0usize;
                 for &(o, l) in &e.ranges {
                     let (o, l) = (o as usize, l as usize);

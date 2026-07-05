@@ -1,3 +1,4 @@
+//! Read SOHM (shared object header message) files produced by libhdf5.
 use hdf5::File;
 
 #[derive(hdf5::H5Type, Clone, PartialEq, Debug)]
@@ -10,8 +11,12 @@ struct Row {
 }
 
 fn main() -> hdf5::Result<()> {
-    let d = "/private/tmp/claude-501/-Users-Shared-hdf5-rs/0ebd41ce-ec10-4ac9-9239-8cf4acc80aa8/scratchpad";
-    for fname in ["sohm1", "sohm2"] {
+    // reference files are produced by `python3 interop/make_sohm.py <dir>`
+    let Some(d) = std::env::args().nth(1) else {
+        println!("usage: sohm <dir with sohm_list.h5/sohm_btree.h5>; skipping");
+        return Ok(());
+    };
+    for fname in ["sohm_list", "sohm_btree"] {
         let f = File::open(format!("{d}/{fname}.h5"))?;
         for i in 0..6 {
             let ds = f.dataset(&format!("d{i}"))?;
