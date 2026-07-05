@@ -77,6 +77,7 @@ With feature flags:
 cargo run --features rlx  --example rlx_tensor # datasets straight into RLX tensors
 cargo run --features rlx  --example rlx_mlp    # HDF5 checkpoint -> RLX forward pass
 cargo run --features mpi  --example mpi_demo   # 4 processes, one shared file
+cargo run --features mpi-rs --example mpi_rs_demo # same, over the mpi-rs crate
 cargo run --features szip --example szval -- <dir>  # szip codec validation
 ```
 
@@ -100,6 +101,7 @@ let out = y.to_vec();                              // compiled forward pass
 | *(default)* | Full read/write engine; DEFLATE, shuffle, fletcher32, LZF, blosc, scale-offset, n-bit filters |
 | `szip` | Pure-Rust SZip (extended-Rice/CCSDS 121.0) codec, validated against libaec |
 | `mpi` | SPMD collective files over a built-in TCP mini-MPI (`hdf5::mpi`) — one shared physical file written by N Rust processes; not wire-compatible with OpenMPI |
+| `mpi-rs` | Back `hdf5::mpi::Comm` with the pure-Rust [mpi-rs](https://crates.io/crates/mpi-rs) crate (rsmpi-compatible API): launch ranks with its `mpiexec`, adopt an app-initialized universe via `Comm::from_mpi_rs`, or run standalone as a singleton. Implies `mpi` |
 | `rlx` | `Container::read_tensor()` — load any numeric dataset/attribute directly as an [RLX](https://crates.io/crates/rlx) tensor (`rlx@0.2.10`). Ops compose lazily, fuse, and run on RLX's bundled cpu backend — HDF5 checkpoints feed straight into inference (see `examples/rlx_mlp.rs`) |
 | `complex` | Complex-number datatypes (`num-complex`) |
 | `f16` | Half-precision floats (`half`) |
@@ -244,7 +246,11 @@ python3 interop/check_h5py.py verify /tmp/interop
   write log and produces the single physical file (single-aggregator
   two-phase I/O). Vlen writes are rejected in MPI mode, matching real
   parallel HDF5. See `examples/mpi_demo.rs` (N processes, one shared file,
-  verified with h5py).
+  verified with h5py). With the `mpi-rs` feature, `Comm` runs on the
+  [mpi-rs](https://crates.io/crates/mpi-rs) crate instead — a full pure-Rust
+  MPI with an rsmpi-compatible API and a real `mpiexec` launcher
+  (`Comm::init` picks the transport automatically; see
+  `examples/mpi_rs_demo.rs`).
 - **SZip** (cargo feature `szip`): a pure-Rust extended-Rice (CCSDS 121.0)
   codec transcribed from libaec — encode *and* decode, EC/NN coding, 8/16-bit
   samples plus byte-interleaved 32/64-bit, scanline padding, zero-block/ROS

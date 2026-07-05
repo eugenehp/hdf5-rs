@@ -16,6 +16,21 @@
 //! Rendezvous: rank 0 listens on `H5MPI_PORT`; other ranks connect and
 //! identify themselves. `spawn_workers` launches N copies of the current
 //! executable with the environment prepared (a minimal `mpiexec -n`).
+//!
+//! # Alternative transport: the `mpi-rs` crate (cargo feature `mpi-rs`)
+//!
+//! With the `mpi-rs` feature, [`Comm`] can instead run on top of the
+//! [`mpi-rs`](https://crates.io/crates/mpi-rs) crate — a pure-Rust MPI
+//! implementation with an rsmpi-compatible API and a real `mpiexec`
+//! launcher. [`Comm::init`] picks the transport automatically:
+//!
+//! - `H5MPI_RANK` set → the built-in TCP star (spawned via [`spawn_workers`]);
+//! - otherwise → the `mpi-rs` runtime: the `mpiexec`-launched world, the
+//!   application's own already-initialized universe, or a singleton
+//!   (1 rank) when run standalone.
+//!
+//! Everything above the communicator — [`create`], [`open`], collective
+//! close — is identical for both transports.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -36,6 +51,32 @@ enum Links {
     Root(Vec<Mutex<TcpStream>>),
     /// Other ranks: single stream to rank 0.
     Leaf(Mutex<TcpStream>),
+    /// Transport delegated to the `mpi-rs` crate. Holds the universe when
+    /// this `Comm` initialized MPI itself (`None` = adopted an environment
+    /// the application initialized), keeping it alive for the comm's life.
+    #[cfg(feature = "mpi-rs")]
+    MpiRs { _universe: Option<mpi_rs::Universe> },
+}
+
+/// Point-to-point send over the mpi-rs world (length-delimited, like frames).
+#[cfg(feature = "mpi-rs")]
+fn mpirs_send(rank: usize, data: &[u8]) {
+    use mpi_rs::point_to_point::Destination;
+    use mpi_rs::topology::Communicator;
+    mpi_rs::topology::SimpleCommunicator::world()
+        .process_at_rank(rank as mpi_rs::Rank)
+        .send(data);
+}
+
+/// Point-to-point receive from a specific rank over the mpi-rs world.
+#[cfg(feature = "mpi-rs")]
+fn mpirs_recv(rank: usize) -> Vec<u8> {
+    use mpi_rs::point_to_point::Source;
+    use mpi_rs::topology::Communicator;
+    mpi_rs::topology::SimpleCommunicator::world()
+        .process_at_rank(rank as mpi_rs::Rank)
+        .receive_vec::<u8>()
+        .0
 }
 
 /// An MPI-style communicator over TCP with a star topology through rank 0.
@@ -68,10 +109,42 @@ fn recv_frame(s: &mut TcpStream) -> Result<Vec<u8>> {
 }
 
 impl Comm {
-    /// Join the communicator described by `H5MPI_RANK` / `H5MPI_SIZE` /
-    /// `H5MPI_PORT` (and optional `H5MPI_HOST`). Collective: blocks until
-    /// every rank has joined.
+    /// Join the world communicator. Collective: blocks until every rank has
+    /// joined.
+    ///
+    /// When `H5MPI_RANK` / `H5MPI_SIZE` / `H5MPI_PORT` are set (a world
+    /// launched via [`spawn_workers`]), joins the built-in TCP transport.
+    /// Otherwise, with the `mpi-rs` feature, initializes (or adopts) the
+    /// `mpi-rs` runtime: an `mpiexec`-launched world or a singleton.
     pub fn init() -> Result<Self> {
+        #[cfg(feature = "mpi-rs")]
+        if std::env::var("H5MPI_RANK").is_err() {
+            return Ok(Self::wrap_mpi_rs(mpi_rs::initialize()));
+        }
+        Self::init_tcp()
+    }
+
+    /// Build a communicator over an `mpi-rs` universe the application
+    /// initialized itself (`mpi::initialize()` from the `mpi-rs` crate).
+    /// The universe is owned by the returned `Comm` (and its clones);
+    /// dropping the last clone finalizes MPI.
+    #[cfg(feature = "mpi-rs")]
+    pub fn from_mpi_rs(universe: mpi_rs::Universe) -> Self {
+        Self::wrap_mpi_rs(Some(universe))
+    }
+
+    #[cfg(feature = "mpi-rs")]
+    fn wrap_mpi_rs(universe: Option<mpi_rs::Universe>) -> Self {
+        use mpi_rs::topology::Communicator;
+        let world = mpi_rs::topology::SimpleCommunicator::world();
+        Self {
+            rank: world.rank() as usize,
+            size: world.size() as usize,
+            links: Arc::new(Links::MpiRs { _universe: universe }),
+        }
+    }
+
+    fn init_tcp() -> Result<Self> {
         let rank: usize = std::env::var("H5MPI_RANK")
             .map_err(|_| "H5MPI_RANK not set (launch via mpi::spawn_workers)")?
             .parse()
@@ -164,6 +237,13 @@ impl Comm {
         match &*self.links {
             Links::Leaf(s) => send_frame(&mut s.lock().unwrap(), data),
             Links::Root(_) => Err("send_to_root called on rank 0".into()),
+            #[cfg(feature = "mpi-rs")]
+            Links::MpiRs { .. } if self.rank == 0 => Err("send_to_root called on rank 0".into()),
+            #[cfg(feature = "mpi-rs")]
+            Links::MpiRs { .. } => {
+                mpirs_send(0, data);
+                Ok(())
+            }
         }
     }
 
@@ -171,6 +251,10 @@ impl Comm {
         match &*self.links {
             Links::Leaf(s) => recv_frame(&mut s.lock().unwrap()),
             Links::Root(_) => Err("recv_from_root called on rank 0".into()),
+            #[cfg(feature = "mpi-rs")]
+            Links::MpiRs { .. } if self.rank == 0 => Err("recv_from_root called on rank 0".into()),
+            #[cfg(feature = "mpi-rs")]
+            Links::MpiRs { .. } => Ok(mpirs_recv(0)),
         }
     }
 
@@ -178,6 +262,13 @@ impl Comm {
         match &*self.links {
             Links::Root(streams) => send_frame(&mut streams[rank].lock().unwrap(), data),
             Links::Leaf(_) => Err("root_send called on a non-root rank".into()),
+            #[cfg(feature = "mpi-rs")]
+            Links::MpiRs { .. } if self.rank != 0 => Err("root_send called on a non-root rank".into()),
+            #[cfg(feature = "mpi-rs")]
+            Links::MpiRs { .. } => {
+                mpirs_send(rank, data);
+                Ok(())
+            }
         }
     }
 
@@ -185,11 +276,21 @@ impl Comm {
         match &*self.links {
             Links::Root(streams) => recv_frame(&mut streams[rank].lock().unwrap()),
             Links::Leaf(_) => Err("root_recv called on a non-root rank".into()),
+            #[cfg(feature = "mpi-rs")]
+            Links::MpiRs { .. } if self.rank != 0 => Err("root_recv called on a non-root rank".into()),
+            #[cfg(feature = "mpi-rs")]
+            Links::MpiRs { .. } => Ok(mpirs_recv(rank)),
         }
     }
 
     /// Collective barrier.
     pub fn barrier(&self) -> Result<()> {
+        #[cfg(feature = "mpi-rs")]
+        if let Links::MpiRs { .. } = &*self.links {
+            use mpi_rs::collective::CommunicatorCollectives;
+            mpi_rs::topology::SimpleCommunicator::world().barrier();
+            return Ok(());
+        }
         if self.rank == 0 {
             for r in 1..self.size {
                 self.root_recv(r)?;
@@ -342,9 +443,17 @@ pub fn spawn_workers(n: usize) -> Result<Vec<std::process::Child>> {
     Ok(children)
 }
 
-/// Returns true when running inside a spawned rank.
+/// Returns true when running inside a spawned rank — either one launched by
+/// [`spawn_workers`] or (with the `mpi-rs` feature) by mpi-rs's `mpiexec`.
 pub fn is_worker() -> bool {
-    std::env::var("H5MPI_RANK").is_ok()
+    if std::env::var("H5MPI_RANK").is_ok() {
+        return true;
+    }
+    #[cfg(feature = "mpi-rs")]
+    if std::env::var("MPI_PMI_ROOT").is_ok() {
+        return true;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -486,5 +595,40 @@ impl MpiFile {
         }
         self.log.clear();
         Ok(true)
+    }
+}
+
+#[cfg(all(test, feature = "mpi-rs"))]
+mod tests {
+    use super::*;
+
+    /// Singleton world over the mpi-rs backend: `init` without any launcher
+    /// env must yield rank 0 of 1, working collectives, and a collective
+    /// file that closes into a readable single-rank HDF5 file.
+    /// (Multi-rank operation is exercised by `examples/mpi_rs_demo.rs`
+    /// under mpi-rs's `mpiexec`.)
+    #[test]
+    fn mpi_rs_singleton_collective_file() {
+        assert!(std::env::var("H5MPI_RANK").is_err(), "test env leaked");
+        let comm = Comm::init().unwrap();
+        assert_eq!((comm.rank(), comm.size()), (0, 1));
+
+        comm.barrier().unwrap();
+        assert_eq!(comm.bcast(b"tok", 0).unwrap(), b"tok");
+        assert_eq!(comm.allgather(b"me").unwrap(), vec![b"me".to_vec()]);
+        assert_eq!(comm.allreduce_u64(7, Op::Sum).unwrap(), 7);
+        assert_eq!(comm.allreduce_f64(2.5, Op::Max).unwrap(), 2.5);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mpi_rs_singleton.h5");
+        let f = super::create(&path, &comm).unwrap();
+        let ds = f.new_dataset::<i32>().shape([comm.size(), 3]).create("x").unwrap();
+        ds.write_slice(&ndarray::arr1(&[1i32, 2, 3]), ndarray::s![0..1, ..])
+            .unwrap();
+        f.close().unwrap();
+
+        let f = crate::File::open(&path).unwrap();
+        let x: Vec<i32> = f.dataset("x").unwrap().read_raw().unwrap();
+        assert_eq!(x, [1, 2, 3]);
     }
 }

@@ -30,6 +30,10 @@
 //! - `szip` — pure-Rust SZip (extended-Rice) codec, validated against libaec.
 //! - `mpi` — SPMD collective files over a built-in TCP mini-MPI
 //!   ([`mpi::Comm`]); not wire-compatible with OpenMPI/MPICH.
+//! - `mpi-rs` — back [`mpi::Comm`] with the pure-Rust
+//!   [`mpi-rs`](https://crates.io/crates/mpi-rs) crate (rsmpi-compatible
+//!   API): launch ranks with its `mpiexec`, adopt an app-initialized
+//!   universe, or run as a singleton. Implies `mpi`.
 //! - `rlx` — [`Container::read_tensor`](crate::Container::read_tensor):
 //!   load datasets/attributes directly as `rlx` tensors, compose ops
 //!   lazily, and run them on RLX's bundled cpu backend (`to_vec`).
@@ -163,16 +167,6 @@ pub fn is_library_threadsafe() -> bool {
     true
 }
 
-#[cfg(test)]
-pub mod tests {
-    use crate::library_version;
-
-    #[test]
-    pub fn test_library_version() {
-        assert!(library_version() >= (1, 8, 4));
-    }
-}
-
 /// Validation hook (examples only): raw SZ_BufftoBuffCompress equivalent.
 #[cfg(feature = "szip")]
 pub fn internal_szip_compress(cd: &[u32], data: &[u8]) -> Result<Vec<u8>> {
@@ -183,4 +177,14 @@ pub fn internal_szip_compress(cd: &[u32], data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(feature = "szip")]
 pub fn internal_szip_decompress(cd: &[u32], data: &[u8], out_len: usize) -> Result<Vec<u8>> {
     format::szip::sz_decompress(cd, data, out_len)
+}
+
+#[cfg(test)]
+pub mod tests {
+    use crate::library_version;
+
+    #[test]
+    pub fn test_library_version() {
+        assert!(library_version() >= (1, 8, 4));
+    }
 }

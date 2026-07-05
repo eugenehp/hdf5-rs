@@ -20,7 +20,7 @@ fn main() -> hdf5::Result<()> {
         for i in 0..6 {
             ds.new_attr::<i32>()
                 .create(format!("small{i}").as_str())?
-                .write_scalar(&(i as i32))?;
+                .write_scalar(&i)?;
         }
         // one mid-size (managed, but needs a larger direct block row)
         let mid = Array1::from_shape_fn(400, |i| i as f32);

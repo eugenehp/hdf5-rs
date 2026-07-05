@@ -1,4 +1,3 @@
-#[cfg(feature = "blosc")]
 use hdf5::filters::blosc_set_nthreads;
 use hdf5::{File, H5Type, Result};
 use ndarray::{arr2, s};
@@ -28,10 +27,8 @@ fn write_hdf5() -> Result<()> {
     use Color::*;
     let file = File::create("pixels.h5")?; // open for writing
     let group = file.create_group("dir")?; // create a group
-    #[cfg(feature = "blosc")]
     blosc_set_nthreads(2); // set number of blosc threads
     let builder = group.new_dataset_builder();
-    #[cfg(feature = "blosc")]
     let builder = builder.blosc_zstd(9, true); // zstd + shuffle
     let ds = builder
         .with_data(&arr2(&[

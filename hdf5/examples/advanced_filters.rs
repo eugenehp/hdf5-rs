@@ -45,7 +45,7 @@ fn main() -> hdf5::Result<()> {
         for i in 0..12 {
             g.new_dataset::<i32>()
                 .create(format!("m{i:02}").as_str())?
-                .write_scalar(&(i as i32))?;
+                .write_scalar(&i)?;
         }
         f.close()?;
     }

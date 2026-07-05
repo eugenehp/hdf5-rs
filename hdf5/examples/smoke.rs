@@ -12,7 +12,7 @@ fn main() -> hdf5::Result<()> {
             .new_dataset_builder()
             .with_data(&arr2(&[[1i32, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]))
             .create("mat")?;
-        ds.new_attr::<f64>().create("pi")?.write_scalar(&3.14159)?;
+        ds.new_attr::<f64>().create("pi")?.write_scalar(&std::f64::consts::PI)?;
         file.new_dataset_builder()
             .with_data(&ndarray::arr1(&[1.5f64, 2.5, 3.5]))
             .create("vec")?;
@@ -24,7 +24,7 @@ fn main() -> hdf5::Result<()> {
     let mat: ndarray::Array2<i32> = f.dataset("grp/mat")?.read_2d()?;
     assert_eq!(mat[[2, 3]], 12);
     let pi: f64 = f.dataset("grp/mat")?.attr("pi")?.read_scalar()?;
-    assert!((pi - 3.14159).abs() < 1e-12);
+    assert!((pi - std::f64::consts::PI).abs() < 1e-12);
     let ans: i64 = f.attr("answer")?.read_scalar()?;
     assert_eq!(ans, 42);
     println!("rust roundtrip OK");

@@ -450,49 +450,6 @@ pub fn blosclz_compress(input: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn blosclz_roundtrip() {
-        for data in [
-            b"hello hello hello hello hello hello".to_vec(),
-            (0..50_000u32)
-                .flat_map(|i| ((i * 7) % 253).to_le_bytes())
-                .collect::<Vec<u8>>(),
-            vec![42u8; 10_000],
-        ] {
-            if let Some(c) = blosclz_compress(&data) {
-                assert_eq!(blosclz_decompress(&c, data.len()).unwrap(), data);
-            }
-        }
-    }
-
-    #[test]
-    fn frame_roundtrip_all_codecs() {
-        let data: Vec<u8> = (0..300_000u32)
-            .flat_map(|i| ((i / 3) as u16).to_le_bytes())
-            .collect();
-        for codec in [
-            CODEC_BLOSCLZ,
-            CODEC_LZ4,
-            CODEC_SNAPPY,
-            CODEC_ZLIB,
-            CODEC_ZSTD,
-        ] {
-            for shuffle in [0u8, 1, 2] {
-                let c = compress(codec, 5, shuffle, 2, &data).unwrap();
-                assert_eq!(
-                    decompress(&c).unwrap(),
-                    data,
-                    "codec {codec} shuffle {shuffle}"
-                );
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // bit-shuffle (bitshuffle-generic.c scalar path, little-endian)
 // ---------------------------------------------------------------------------
@@ -592,4 +549,47 @@ fn shuffle_bytes_n(typesize: usize, data: &[u8], n: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blosclz_roundtrip() {
+        for data in [
+            b"hello hello hello hello hello hello".to_vec(),
+            (0..50_000u32)
+                .flat_map(|i| ((i * 7) % 253).to_le_bytes())
+                .collect::<Vec<u8>>(),
+            vec![42u8; 10_000],
+        ] {
+            if let Some(c) = blosclz_compress(&data) {
+                assert_eq!(blosclz_decompress(&c, data.len()).unwrap(), data);
+            }
+        }
+    }
+
+    #[test]
+    fn frame_roundtrip_all_codecs() {
+        let data: Vec<u8> = (0..300_000u32)
+            .flat_map(|i| ((i / 3) as u16).to_le_bytes())
+            .collect();
+        for codec in [
+            CODEC_BLOSCLZ,
+            CODEC_LZ4,
+            CODEC_SNAPPY,
+            CODEC_ZLIB,
+            CODEC_ZSTD,
+        ] {
+            for shuffle in [0u8, 1, 2] {
+                let c = compress(codec, 5, shuffle, 2, &data).unwrap();
+                assert_eq!(
+                    decompress(&c).unwrap(),
+                    data,
+                    "codec {codec} shuffle {shuffle}"
+                );
+            }
+        }
+    }
 }

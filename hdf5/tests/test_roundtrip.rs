@@ -446,7 +446,7 @@ fn large_group_many_links() {
             f.new_dataset::<i32>()
                 .create(format!("d{i:04}").as_str())
                 .unwrap()
-                .write_scalar(&(i as i32))
+                .write_scalar(&i)
                 .unwrap();
         }
     }

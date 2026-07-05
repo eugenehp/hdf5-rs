@@ -525,6 +525,10 @@ impl From<&Self> for Extents {
 }
 
 #[cfg(test)]
+// borrowed args and reversed ranges below are deliberate: the tests cover
+// the `From<&T>` conversions and `is_valid()` rejection of empty extents
+#[allow(clippy::needless_borrows_for_generic_args)]
+#[allow(clippy::reversed_empty_ranges)]
 pub mod tests {
     use super::{Extent, Extents, SimpleExtents};
 

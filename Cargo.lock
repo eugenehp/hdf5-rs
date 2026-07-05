@@ -180,7 +180,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hdf5-no-c"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -191,6 +191,7 @@ dependencies = [
  "libc",
  "lz4_flex",
  "memmap2",
+ "mpi-rs",
  "ndarray",
  "num-complex",
  "parking_lot",
@@ -203,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-no-c-derive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hdf5-no-c",
  "proc-macro-error",
@@ -215,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-no-c-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ascii",
  "cfg-if",
@@ -312,6 +313,12 @@ dependencies = [
  "adler2",
  "simd-adler32",
 ]
+
+[[package]]
+name = "mpi-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b08fa7680045874a2a913fef179ab87a29a4f1bf73a09052e6f5bb9c7555083"
 
 [[package]]
 name = "ndarray"

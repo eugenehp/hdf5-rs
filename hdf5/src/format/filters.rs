@@ -356,28 +356,6 @@ pub fn lzf_decompress(input: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-#[cfg(test)]
-mod lzf_tests {
-    use super::{lzf_compress, lzf_decompress};
-
-    #[test]
-    fn lzf_roundtrip() {
-        for data in [
-            b"".to_vec(),
-            b"a".to_vec(),
-            b"hello hello hello hello hello".to_vec(),
-            (0..10_000u32)
-                .flat_map(|i| (i % 251).to_le_bytes())
-                .collect::<Vec<u8>>(),
-            vec![0u8; 65536],
-            (0..=255u8).cycle().take(100_000).collect::<Vec<u8>>(),
-        ] {
-            let c = lzf_compress(&data);
-            assert_eq!(lzf_decompress(&c).unwrap(), data);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // ScaleOffset filter (H5Zscaleoffset.c) -- decode only
 // ---------------------------------------------------------------------------
@@ -844,4 +822,26 @@ pub fn scaleoffset_compress(cdata: &[u32], data: &[u8]) -> Result<Vec<u8>> {
     let expect = 21 + (nelmts * size * minbits as usize) / (size * 8) + 1;
     out.resize(expect.max(out.len()), 0);
     Ok(out)
+}
+
+#[cfg(test)]
+mod lzf_tests {
+    use super::{lzf_compress, lzf_decompress};
+
+    #[test]
+    fn lzf_roundtrip() {
+        for data in [
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"hello hello hello hello hello".to_vec(),
+            (0..10_000u32)
+                .flat_map(|i| (i % 251).to_le_bytes())
+                .collect::<Vec<u8>>(),
+            vec![0u8; 65536],
+            (0..=255u8).cycle().take(100_000).collect::<Vec<u8>>(),
+        ] {
+            let c = lzf_compress(&data);
+            assert_eq!(lzf_decompress(&c).unwrap(), data);
+        }
+    }
 }

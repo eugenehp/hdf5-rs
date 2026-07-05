@@ -27,6 +27,9 @@ zlib = []
 szip = []
 # Enable the pure-Rust MPI subset (SPMD collective files over TCP).
 mpi = []
+# Back `mpi::Comm` with the `mpi-rs` crate (pure-Rust, rsmpi-compatible API):
+# launch ranks with mpi-rs's `mpiexec`, or adopt an app-initialized universe.
+mpi-rs = ["mpi", "dep:mpi_rs"]
 # Load datasets/attributes directly as RLX tensors (`Container::read_tensor`).
 rlx = ["dep:rlx"]
 # `rlx` already includes host evaluation: RLX's default `cpu` backend
@@ -49,6 +52,8 @@ snap = "1.1"
 ruzstd = "0.7"
 memmap2 = "0.9"
 rlx = { version = "0.2.10", features = ["tensor"], optional = true }
+# renamed: its lib target is `mpi`, which would shadow our `hdf5::mpi` module
+mpi_rs = { package = "mpi-rs", version = "0.1.0", optional = true }
 half = { workspace = true, optional = true }
 # internal
 hdf5-no-c-derive = { workspace = true }
@@ -77,6 +82,10 @@ required-features = ["szip"]
 [[example]]
 name = "mpi_demo"
 required-features = ["mpi"]
+
+[[example]]
+name = "mpi_rs_demo"
+required-features = ["mpi-rs"]
 
 [[example]]
 name = "rlx_tensor"
