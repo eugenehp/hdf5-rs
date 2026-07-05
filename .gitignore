@@ -1,0 +1,17 @@
+# build artifacts
+/target/
+**/*.rs.bk
+
+# editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# HDF5 files produced by examples and tests
+*.h5
+*.hdf5
+*.nc
+
+# scratch output
+/tmp/

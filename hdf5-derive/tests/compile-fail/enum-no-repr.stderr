@@ -1,0 +1,5 @@
+error: `H5Type` can only be derived for enums with explicit representation
+ --> $DIR/enum-no-repr.rs:7:6
+  |
+7 | enum Foo {
+  |      ^^^

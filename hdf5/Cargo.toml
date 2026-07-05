@@ -1,0 +1,74 @@
+[package]
+name = "hdf5-no-c"
+description = "Pure-Rust implementation of HDF5 with a drop-in API compatible with the FFI `hdf5` crate."
+categories = ["science", "filesystem"]
+readme = "../README.md"
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+
+[lib]
+# The package is `hdf5-no-c`; the library target keeps the name `hdf5` so all
+# code written against the FFI crate (`use hdf5::...`, including the derive
+# macro's generated `extern crate hdf5`) compiles unchanged.
+name = "hdf5"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Enable zlib/DEFLATE compression filter (pure-Rust miniz_oxide backend).
+zlib = []
+# Enable the SZip (extended-Rice) compression filter, pure-Rust.
+szip = []
+# Enable the pure-Rust MPI subset (SPMD collective files over TCP).
+mpi = []
+# Enable complex number type support.
+complex = ["hdf5-types/complex"]
+# Enable float16 type support.
+f16 = ["hdf5-types/f16", "dep:half"]
+
+[dependencies]
+# external
+bitflags = "2.4"
+cfg-if = { workspace = true }
+libc = { workspace = true }
+ndarray = "0.15"
+parking_lot = "0.12"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
+snap = "1.1"
+ruzstd = "0.7"
+memmap2 = "0.9"
+half = { workspace = true, optional = true }
+# internal
+hdf5-derive = { workspace = true }
+hdf5-types = { workspace = true }
+
+[dev-dependencies]
+half = { workspace = true }
+num-complex = { workspace = true }
+pretty_assertions = "1.4"
+tempfile = "3.9"
+
+[[example]]
+name = "simple"
+
+[[example]]
+name = "chunking"
+
+[[example]]
+name = "szval"
+required-features = ["szip"]
+
+[[example]]
+name = "szfile"
+required-features = ["szip"]
+
+[[example]]
+name = "mpi_demo"
+required-features = ["mpi"]

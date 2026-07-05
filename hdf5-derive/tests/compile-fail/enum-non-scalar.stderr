@@ -1,0 +1,5 @@
+error: `H5Type` can only be derived for enums with scalar discriminants
+ --> $DIR/enum-non-scalar.rs:7:6
+  |
+7 | enum Foo {
+  |      ^^^

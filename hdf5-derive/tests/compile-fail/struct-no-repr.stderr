@@ -1,0 +1,5 @@
+error: `H5Type` requires repr(C), repr(packed) or repr(transparent) for structs
+ --> $DIR/struct-no-repr.rs:7:8
+  |
+7 | struct Foo {
+  |        ^^^
