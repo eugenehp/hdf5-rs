@@ -3,10 +3,17 @@
 use std::str::FromStr;
 
 use ndarray::{arr1, arr2, s, Array1, Array2, ArrayD};
-use tempfile::tempdir;
 
 use hdf5::types::{FixedAscii, FixedUnicode, VarLenArray, VarLenAscii, VarLenUnicode};
 use hdf5::{File, H5Type};
+
+/// `tempfile::tempdir`, also under WASI, which has no `temp_dir` (the test
+/// runner, `interop/wasi_run.mjs`, preopens the host's as `/tmp`).
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    #[cfg(target_os = "wasi")]
+    let _ = tempfile::env::override_temp_dir(std::path::Path::new("/tmp"));
+    tempfile::tempdir()
+}
 
 #[derive(H5Type, Clone, PartialEq, Debug)]
 #[repr(u8)]
@@ -802,4 +809,62 @@ fn rlx_read_tensor() {
         .create("words")
         .unwrap();
     assert!(fw.dataset("words").unwrap().read_tensor().is_err());
+}
+
+/// Variable-length strings in a chunked dataset — an extendable one appended to piece by
+/// piece, as a log or a marker stream is written — read back after the file is reopened.
+/// (The chunk decode is deferred; the strings' heap references used to be resolved before it,
+/// from zeros, and every string came back empty. libhdf5 read the same file correctly.)
+#[test]
+fn chunked_vlen_strings_survive_reopen() {
+    use hdf5::types::VarLenUnicode;
+    use ndarray::{s, Array1, Array2};
+    let path = std::env::temp_dir().join(format!("hdf5_chunked_vlen_{}.h5", std::process::id()));
+    let text = |s: &str| -> VarLenUnicode { s.parse().unwrap() };
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        let log = file
+            .new_dataset::<VarLenUnicode>()
+            .shape((0..,))
+            .chunk((4,))
+            .create("log")
+            .unwrap();
+        for k in 0..10usize {
+            log.resize(k + 1).unwrap();
+            log.write_slice(
+                &Array1::from(vec![text(&format!("entry {k} é"))]),
+                s![k..k + 1],
+            )
+            .unwrap();
+        }
+        let table = file
+            .new_dataset::<VarLenUnicode>()
+            .shape((0.., 2))
+            .chunk((3, 2))
+            .create("table")
+            .unwrap();
+        table.resize((2, 2)).unwrap();
+        let block = Array2::from_shape_vec(
+            (2, 2),
+            vec![text("a"), text(""), text("c"), text(&"x".repeat(300))],
+        )
+        .unwrap();
+        table.write_slice(&block, s![0..2, ..]).unwrap();
+        file.close().unwrap();
+    }
+    let file = hdf5::File::open(&path).unwrap();
+    let log: Vec<VarLenUnicode> = file.dataset("log").unwrap().read_raw().unwrap();
+    let want: Vec<String> = (0..10).map(|k| format!("entry {k} é")).collect();
+    assert_eq!(
+        log.iter()
+            .map(|t| t.as_str().to_string())
+            .collect::<Vec<_>>(),
+        want
+    );
+    let table: Vec<VarLenUnicode> = file.dataset("table").unwrap().read_raw().unwrap();
+    let table: Vec<&str> = table.iter().map(|t| t.as_str()).collect();
+    assert_eq!(table[..3], ["a", "", "c"]);
+    assert_eq!(table[3].len(), 300);
+    drop(file);
+    let _ = std::fs::remove_file(&path);
 }

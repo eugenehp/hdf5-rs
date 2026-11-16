@@ -69,6 +69,19 @@ pub fn encode(desc: &TypeDescriptor) -> Vec<u8> {
     b.bytes
 }
 
+/// The datatype message of an object reference (`H5R_OBJECT`): class 7,
+/// version 1, reference type 0, 8 bytes (the referenced object header's
+/// address).
+pub fn encode_object_reference() -> Vec<u8> {
+    let mut b = Buf::new();
+    b.u8(class_version_byte(1, CLASS_REFERENCE));
+    b.u8(0);
+    b.u8(0);
+    b.u8(0);
+    b.u32(8);
+    b.bytes
+}
+
 fn class_version_byte(version: u8, class: u8) -> u8 {
     (version << 4) | class
 }
@@ -314,7 +327,7 @@ pub fn decode_ordered(c: &mut Cursor, order: &mut OrderTree) -> Result<TypeDescr
                 }
                 // v1/v2: names padded to a multiple of 8
                 if version < 3 {
-                    let consumed = c.pos - nstart;
+                    let consumed = (c.pos - nstart) as usize; // a name's length
                     let pad = align8(consumed) - consumed;
                     c.skip(pad);
                 }
@@ -366,7 +379,7 @@ pub fn decode_ordered(c: &mut Cursor, order: &mut OrderTree) -> Result<TypeDescr
                     name.push(byte);
                 }
                 if version < 3 {
-                    let consumed = c.pos - nstart;
+                    let consumed = (c.pos - nstart) as usize; // a name's length
                     let pad = align8(consumed) - consumed;
                     c.skip(pad);
                 }

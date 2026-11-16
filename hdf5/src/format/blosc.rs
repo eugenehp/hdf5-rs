@@ -124,10 +124,10 @@ pub fn decompress(src: &[u8]) -> Result<Vec<u8>> {
                         v
                     }
                     CODEC_ZSTD => {
-                        let mut d = ruzstd::StreamingDecoder::new(payload)
-                            .map_err(|e| format!("blosc/zstd: {e}"))?;
+                        // capped at the sub-block's size: a bomb stops there
                         let mut v = Vec::with_capacity((neblock).min(1 << 16));
-                        d.read_to_end(&mut v)
+                        zstd_rs::Decompressor::new()
+                            .decompress(payload, None, neblock, &mut v)
                             .map_err(|e| format!("blosc/zstd: {e}"))?;
                         v
                     }
@@ -243,29 +243,17 @@ pub fn compress(
     Ok(out)
 }
 
+/// Blosc's byte shuffle is HDF5's (trailing partial element copied as is):
+/// the same SIMD kernels.
 fn shuffle_bytes(typesize: usize, data: &[u8]) -> Vec<u8> {
-    let n = data.len() / typesize;
     let mut out = vec![0u8; data.len()];
-    for j in 0..typesize {
-        for i in 0..n {
-            out[j * n + i] = data[i * typesize + j];
-        }
-    }
-    let tail = n * typesize;
-    out[tail..].copy_from_slice(&data[tail..]);
+    super::simd::shuffle(typesize, data, &mut out);
     out
 }
 
 fn unshuffle_bytes(typesize: usize, data: &[u8]) -> Vec<u8> {
-    let n = data.len() / typesize;
     let mut out = vec![0u8; data.len()];
-    for j in 0..typesize {
-        for i in 0..n {
-            out[i * typesize + j] = data[j * n + i];
-        }
-    }
-    let tail = n * typesize;
-    out[tail..].copy_from_slice(&data[tail..]);
+    super::simd::unshuffle(typesize, data, &mut out);
     out
 }
 
@@ -476,17 +464,13 @@ pub fn bitshuffle_block(typesize: usize, data: &[u8]) -> Vec<u8> {
     let nbyte = size * typesize;
     let nbyte_bitrow = nbyte / 8;
     // 1. byte-transpose within elements
-    let a = shuffle_bytes_n(typesize, &data[..nbyte], size);
-    // 2. bit-transpose within each u64 word
+    let mut a = shuffle_bytes(typesize, &data[..nbyte]);
+    // 2. bit-transpose within each u64 word, then byte k of word ii to
+    //    b[k * nbyte_bitrow + ii] — an 8-byte shuffle of the words
+    trans_bit_words(&mut a);
     let mut b = vec![0u8; nbyte];
-    for ii in 0..nbyte_bitrow {
-        let x = u64::from_le_bytes(a[ii * 8..ii * 8 + 8].try_into().unwrap());
-        let x = trans_bit_8x8(x);
-        let bytes = x.to_le_bytes();
-        for (kk, &byte) in bytes.iter().enumerate() {
-            b[kk * nbyte_bitrow + ii] = byte;
-        }
-    }
+    super::simd::shuffle(8, &a, &mut b);
+    debug_assert_eq!(nbyte_bitrow * 8, nbyte);
     // 3. transpose 8 x typesize blocks of (size/8) bytes
     let blk = size / 8;
     let mut out = vec![0u8; data.len()];
@@ -519,41 +503,92 @@ pub fn bitunshuffle_block(typesize: usize, data: &[u8]) -> Vec<u8> {
             b[dst..dst + blk].copy_from_slice(&data[src..src + blk]);
         }
     }
-    // inverse step 2
+    // inverse step 2: gather each word's bytes back, transpose (its own
+    // inverse)
+    let _ = nbyte_bitrow;
     let mut a = vec![0u8; nbyte];
-    for ii in 0..nbyte_bitrow {
-        let mut x = 0u64;
-        for kk in 0..8 {
-            x |= u64::from(b[kk * nbyte_bitrow + ii]) << (8 * kk);
-        }
-        let x = trans_bit_8x8(x); // self-inverse
-        a[ii * 8..ii * 8 + 8].copy_from_slice(&x.to_le_bytes());
-    }
+    super::simd::unshuffle(8, &b, &mut a);
+    trans_bit_words(&mut a);
     // inverse step 1
     let mut out = vec![0u8; data.len()];
-    for j in 0..typesize {
-        for i in 0..size {
-            out[i * typesize + j] = a[j * size + i];
-        }
-    }
+    super::simd::unshuffle(typesize, &a, &mut out[..nbyte]);
     out[nbyte..].copy_from_slice(&data[nbyte..]);
     out
 }
 
-/// Byte-transpose exactly `n` elements.
-fn shuffle_bytes_n(typesize: usize, data: &[u8], n: usize) -> Vec<u8> {
-    let mut out = vec![0u8; data.len()];
-    for j in 0..typesize {
-        for i in 0..n {
-            out[j * n + i] = data[i * typesize + j];
-        }
+/// [`trans_bit_8x8`] on every 8-byte word, in place — shifts and masks on
+/// 64-bit lanes, which the compiler vectorizes.
+fn trans_bit_words(words: &mut [u8]) {
+    for w in words.chunks_exact_mut(8) {
+        let x = trans_bit_8x8(u64::from_le_bytes(w.try_into().unwrap()));
+        w.copy_from_slice(&x.to_le_bytes());
     }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scalar bitshuffle this crate shipped (validated against
+    /// hdf5plugin), kept as the reference for the vectorized one.
+    fn bitshuffle_reference(typesize: usize, data: &[u8]) -> Vec<u8> {
+        let size = data.len() / typesize;
+        if size % 8 != 0 || size == 0 {
+            return data.to_vec();
+        }
+        let nbyte = size * typesize;
+        let rows = nbyte / 8;
+        let mut a = vec![0u8; nbyte];
+        for j in 0..typesize {
+            for i in 0..size {
+                a[j * size + i] = data[i * typesize + j];
+            }
+        }
+        let mut b = vec![0u8; nbyte];
+        for ii in 0..rows {
+            let x = trans_bit_8x8(u64::from_le_bytes(
+                a[ii * 8..ii * 8 + 8].try_into().unwrap(),
+            ));
+            for (kk, &byte) in x.to_le_bytes().iter().enumerate() {
+                b[kk * rows + ii] = byte;
+            }
+        }
+        let blk = size / 8;
+        let mut out = vec![0u8; data.len()];
+        for ii in 0..8 {
+            for jj in 0..typesize {
+                let (src, dst) = ((ii * typesize + jj) * blk, (jj * 8 + ii) * blk);
+                out[dst..dst + blk].copy_from_slice(&b[src..src + blk]);
+            }
+        }
+        out[nbyte..].copy_from_slice(&data[nbyte..]);
+        out
+    }
+
+    #[test]
+    fn bitshuffle_matches_reference() {
+        let mut x = 0x1234_5678u32;
+        let data: Vec<u8> = (0..40_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        for ts in [1usize, 2, 4, 8, 16, 3] {
+            for len in [8 * ts * 16, 8 * ts * 1000 + 5, 8 * ts * 3] {
+                let d = &data[..len.min(data.len())];
+                let want = bitshuffle_reference(ts, d);
+                assert_eq!(bitshuffle_block(ts, d), want, "typesize {ts} len {len}");
+                assert_eq!(
+                    bitunshuffle_block(ts, &want),
+                    d,
+                    "inverse typesize {ts} len {len}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn blosclz_roundtrip() {

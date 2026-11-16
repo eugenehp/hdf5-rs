@@ -1,0 +1,62 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>hdf5-no-c browser test</title>
+<pre id="log">running</pre>
+<script type="module">
+// Built by: wasm-pack build hdf5-wasm --target web [--out-dir pkg-simd]
+// Served by: node hdf5-wasm/tests/serve.mjs 8000 [big.h5]
+// Open /tests/browser.html?pkg=pkg (or pkg-simd); the result ends up in #log.
+const pkg = new URLSearchParams(location.search).get("pkg") ?? "pkg";
+const log = document.getElementById("log");
+const lines = [];
+const say = (s) => { lines.push(s); log.textContent = lines.join("\n"); };
+const eq = (a, b, what) => {
+  const [x, y] = [JSON.stringify(Array.from(a)), JSON.stringify(Array.from(b))];
+  if (x !== y) throw new Error(`${what}: ${x.slice(0, 80)} != ${y.slice(0, 80)}`);
+};
+try {
+  const m = await import(`../${pkg}/hdf5_wasm.js`);
+  await m.default();
+  say(`engine: ${navigator.userAgent.match(/(Chrome|Firefox|Safari)\/[\d.]+/)?.[0]} pkg=${pkg}`);
+
+  // in memory: write, read back, slices, strings, attributes
+  const f = m.H5File.create();
+  f.createGroup("acq");
+  const rows = 200000, cols = 8;
+  const signal = Float32Array.from({ length: rows * cols }, (_, i) => Math.sin(i / 100));
+  let t = performance.now();
+  f.writeDataset("acq/signal", signal, [rows, cols], [10000, cols], 4);
+  f.writeDataset("labels", ["α", "beta"], [2]);
+  const bytes = f.toBytes();
+  const tw = performance.now() - t;
+  t = performance.now();
+  const g = m.H5File.fromBytes(bytes);
+  const back = g.read("acq/signal");
+  const tr = performance.now() - t;
+  eq(back, signal, "round trip");
+  eq(g.readSlice("acq/signal", [150000, 2], [2, 3]),
+     [signal[150000 * cols + 2], signal[150000 * cols + 3], signal[150000 * cols + 4],
+      signal[150001 * cols + 2], signal[150001 * cols + 3], signal[150001 * cols + 4]], "slice");
+  eq(g.read("labels"), ["α", "beta"], "strings");
+  say(`in-memory: ok — write+gzip ${(rows * cols * 4 / 1e6).toFixed(1)} MB in ${tw.toFixed(0)} ms, read ${tr.toFixed(0)} ms (${(bytes.length / 1e6).toFixed(1)} MB file)`);
+
+  // over HTTP range requests
+  const head = await fetch("/big.h5", { method: "HEAD" });
+  if (head.ok) {
+    t = performance.now();
+    const r = await m.H5Remote.open("/big.h5", 1 << 16);
+    const keys = await r.keys("/");
+    const shape = await r.shape("gzip_cols");
+    const a = await r.readSlice("gzip_cols", [3000000, 0], [64, shape[1]]);
+    const b = await r.readSlice("contig", [3000000, 0], [64, shape[1]]);
+    eq(a, b, "remote gzip vs contig");
+    const size = Number(head.headers.get("content-length"));
+    say(`remote: ok — ${keys.length} keys, 64-row slice of a ${(size / 1e6).toFixed(0)} MB file: fetched ${(r.bytesFetched() / 1e6).toFixed(2)} MB in ${r.roundTrips()} round-trips, ${(performance.now() - t).toFixed(0)} ms`);
+  } else {
+    say("remote: skipped (no /big.h5)");
+  }
+  say("RESULT: PASS");
+} catch (e) {
+  say(`RESULT: FAIL ${e?.stack ?? e}`);
+}
+</script>

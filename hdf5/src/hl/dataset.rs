@@ -207,6 +207,7 @@ impl Dataset {
         let id = self.0.obj_id().ok_or("dataset has no location")?;
         let new_dims: Vec<u64> = shape.dims().iter().map(|&d| d as u64).collect();
         let mut state = file.state.write();
+        state.dirty = true;
         if state.read_only {
             return Err("unable to resize: file is read-only".into());
         }
@@ -223,8 +224,6 @@ impl Dataset {
                 if !matches!(d.layout, LayoutClass::Chunked(_)) {
                     return Err("only chunked datasets can be resized".into());
                 }
-                // resizing rearranges the buffer; load deferred bytes first
-                d.materialize()?;
                 for (i, (&nd, m)) in new_dims.iter().zip(&d.maxdims).enumerate() {
                     if let Some(m) = m {
                         if nd > *m {
@@ -234,6 +233,16 @@ impl Dataset {
                         }
                     }
                 }
+                // chunks still in the file stay there: only the shape changes
+                if let Some(l) = &d.lazy {
+                    if matches!(l.kind, crate::model::LazyKind::Chunked { .. }) {
+                        d.lazy = Some(l.resized(&new_dims)?);
+                        d.dims = new_dims;
+                        return Ok(());
+                    }
+                }
+                // resizing rearranges the buffer; load deferred bytes first
+                d.materialize()?;
                 // Reshape the row-major data buffer in place.
                 let esize = disk_size(&d.dtype);
                 let old_dims = d.dims.clone();
@@ -740,12 +749,14 @@ impl DatasetBuilder {
                 lazy: None,
                 is_scalar,
                 is_null,
+                refs: None,
             };
             let mut state = file.state.write();
+            state.dirty = true;
             if state.read_only {
                 return Err("unable to create dataset: file is read-only".into());
             }
-            let new_id = state.alloc(ObjectKind::Dataset(dataset));
+            let new_id = state.alloc(ObjectKind::Dataset(Box::new(dataset)));
             state.get_mut(new_id).mtime = crate::model::now();
             if let Some(name) = name {
                 let order = state.next_order();
@@ -860,13 +871,15 @@ impl DatasetBuilder {
             lazy: None,
             is_scalar,
             is_null,
+            refs: None,
         };
 
         let mut state = file.state.write();
+        state.dirty = true;
         if state.read_only {
             return Err("unable to create dataset: file is read-only".into());
         }
-        let new_id = state.alloc(ObjectKind::Dataset(dataset));
+        let new_id = state.alloc(ObjectKind::Dataset(Box::new(dataset)));
         state.get_mut(new_id).mtime = crate::model::now();
         if let Some(name) = name {
             // resolve intermediate path

@@ -1,0 +1,24 @@
+[package]
+name = "hdf5-no-c-wasm"
+description = "JavaScript bindings (wasm-bindgen) for hdf5-no-c: read and write HDF5 in the browser and Node."
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+# shipped to npm (`wasm-pack build hdf5-wasm`), not crates.io
+publish = false
+
+[lib]
+name = "hdf5_wasm"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hdf5-no-c = { workspace = true }
+ndarray = "0.15"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"

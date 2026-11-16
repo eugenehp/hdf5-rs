@@ -28,7 +28,10 @@ fn main() -> hdf5::Result<()> {
 
     // collective metadata: identical calls on every rank
     let f = mpi::create(&path, &comm)?;
-    let ds = f.new_dataset::<f64>().shape([size, COLS]).create("matrix")?;
+    let ds = f
+        .new_dataset::<f64>()
+        .shape([size, COLS])
+        .create("matrix")?;
     let total = f.new_dataset::<u64>().create("checksum")?;
 
     // independent data: each rank writes its own row

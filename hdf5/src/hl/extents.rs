@@ -529,6 +529,7 @@ impl From<&Self> for Extents {
 // the `From<&T>` conversions and `is_valid()` rejection of empty extents
 #[allow(clippy::needless_borrows_for_generic_args)]
 #[allow(clippy::reversed_empty_ranges)]
+#[allow(clippy::single_range_in_vec_init)]
 pub mod tests {
     use super::{Extent, Extents, SimpleExtents};
 

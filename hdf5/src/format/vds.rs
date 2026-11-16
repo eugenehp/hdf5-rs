@@ -2,6 +2,7 @@
 //! (`H5Dvirtual.c`, heap encoding versions 0 and 1) and the serialized
 //! dataspace selections it contains (`H5Shyper.c`/`H5Sall.c`/`H5Spoint.c`).
 
+use super::source::MemSource;
 use super::{Buf, Cursor};
 use crate::error::Result;
 
@@ -247,7 +248,8 @@ pub struct VdsMapping {
 
 /// Decode the VDS global-heap block (encoding versions 0 and 1).
 pub fn parse_vds_blob(blob: &[u8]) -> Result<Vec<VdsMapping>> {
-    let mut c = Cursor::new(blob);
+    let blob_src = MemSource::new(blob);
+    let mut c = Cursor::new(&blob_src);
     let version = c.u8()?;
     if version > 1 {
         return Err(format!("unsupported VDS heap encoding version {version}").into());

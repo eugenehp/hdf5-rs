@@ -114,7 +114,66 @@ impl From<Vec<RawSlice>> for RawSelection {
     }
 }
 
+impl RawHyperslab {
+    /// The selected coordinates along each axis, in selection order.
+    pub(crate) fn axis_coords(&self, shape: &[Ix]) -> Result<Vec<Vec<usize>>> {
+        ensure!(self.len() == shape.len(), "selection rank mismatch");
+        let mut axes: Vec<Vec<usize>> = Vec::with_capacity(self.len());
+        for (slice, &dim) in self.iter().zip(shape) {
+            let count = match slice.count {
+                Some(c) => c,
+                None => {
+                    // unlimited: fill up to the dim end
+                    if slice.block == 0 || slice.step == 0 {
+                        0
+                    } else if dim > slice.start {
+                        (dim - slice.start - slice.block) / slice.step + 1
+                    } else {
+                        0
+                    }
+                }
+            };
+            let mut coords = Vec::with_capacity(count.saturating_mul(slice.block).min(1 << 16));
+            for i in 0..count {
+                let base = slice.start + i * slice.step;
+                for j in 0..slice.block {
+                    let c = base + j;
+                    ensure!(c < dim, "selection out of bounds: {} >= {} in axis", c, dim);
+                    coords.push(c);
+                }
+            }
+            axes.push(coords);
+        }
+        Ok(axes)
+    }
+}
+
 impl RawSelection {
+    /// The selection as a [`Pick`](crate::format::reader::Pick): what a
+    /// partial read of lazily stored data decodes from.
+    pub(crate) fn pick(&self, shape: &[Ix]) -> Result<crate::format::reader::Pick> {
+        use crate::format::reader::Pick;
+        let widen = |v: &[usize]| v.iter().map(|&c| c as u64).collect::<Vec<u64>>();
+        Ok(match self {
+            Self::None => Pick::Points(Vec::new()),
+            Self::All => Pick::Axes(shape.iter().map(|&d| (0..d as u64).collect()).collect()),
+            Self::Points(coords) => {
+                check_coords(coords, shape)?;
+                Pick::Points(
+                    coords
+                        .rows()
+                        .into_iter()
+                        .map(|r| widen(&r.to_vec()))
+                        .collect(),
+                )
+            }
+            Self::RegularHyperslab(hyper) => {
+                Pick::Axes(hyper.axis_coords(shape)?.iter().map(|a| widen(a)).collect())
+            }
+            Self::ComplexHyperslab => fail!("Complex hyperslabs are not supported"),
+        })
+    }
+
     /// Enumerate the linear (row-major) element indices selected within an
     /// array of the given shape, in selection order.
     pub(crate) fn linear_indices(&self, shape: &[Ix]) -> Result<Vec<usize>> {
@@ -136,34 +195,7 @@ impl RawSelection {
                 Ok(out)
             }
             Self::RegularHyperslab(hyper) => {
-                ensure!(hyper.len() == shape.len(), "selection rank mismatch");
-                // per-dim list of selected coordinates
-                let mut axes: Vec<Vec<usize>> = Vec::with_capacity(hyper.len());
-                for (slice, &dim) in hyper.iter().zip(shape) {
-                    let count = match slice.count {
-                        Some(c) => c,
-                        None => {
-                            // unlimited: fill up to the dim end
-                            if slice.block == 0 || slice.step == 0 {
-                                0
-                            } else if dim > slice.start {
-                                (dim - slice.start - slice.block) / slice.step + 1
-                            } else {
-                                0
-                            }
-                        }
-                    };
-                    let mut coords = Vec::with_capacity(count * slice.block);
-                    for i in 0..count {
-                        let base = slice.start + i * slice.step;
-                        for j in 0..slice.block {
-                            let c = base + j;
-                            ensure!(c < dim, "selection out of bounds: {} >= {} in axis", c, dim);
-                            coords.push(c);
-                        }
-                    }
-                    axes.push(coords);
-                }
+                let axes = hyper.axis_coords(shape)?;
                 // cartesian product in row-major order
                 let n: usize = axes.iter().map(Vec::len).product();
                 let mut out = Vec::with_capacity(n);

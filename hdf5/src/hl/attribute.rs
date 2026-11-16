@@ -166,6 +166,7 @@ impl AttributeBuilder {
         };
 
         let mut state = file.state.write();
+        state.dirty = true;
         if state.read_only {
             return Err("unable to create attribute: file is read-only".into());
         }
@@ -181,6 +182,7 @@ impl AttributeBuilder {
             is_null,
             data: vec![0u8; n * esize],
             vlen: VlenStore::new(),
+            refs: None,
         });
         drop(state);
         Ok(Attribute::from_handle(Handle::new(Payload::Attribute {

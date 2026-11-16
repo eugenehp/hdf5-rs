@@ -23,6 +23,19 @@
 //!   write.
 //! - Memory-mapped, lazily materialized reads: opening a file costs its
 //!   metadata only.
+//! - Parallel chunk decoding/encoding on a persistent pool
+//!   ([`set_num_threads`], `HDF5_NO_C_THREADS`, [`set_thread_spawner`]),
+//!   and SIMD kernels (NEON, SSE2, AVX2, wasm `simd128`) for the shuffle
+//!   filter, fletcher32, byte-swapping and numeric conversion.
+//! - Partial reads (`read_slice`, point selections) decode only the chunks
+//!   they touch, through a per-dataset decoded-chunk cache
+//!   ([`set_chunk_cache_size`]).
+//! - Streaming writes: flushes append to the file, written datasets become
+//!   views of it, and writes into chunked datasets go straight to disk.
+//! - Async remote reads ([`remote::RemoteFile`]) over any range reader.
+//! - WebAssembly: `wasm32-unknown-unknown` with in-memory files
+//!   ([`File::from_bytes`], [`File::create_in_memory`], [`File::to_bytes`]),
+//!   `wasm32-wasip1` with path-based files too, and `wasm32-wasip1-threads`.
 //!
 //! # Cargo features
 //!
@@ -59,7 +72,8 @@ mod export {
             AttributeBuilderEmptyShape, ByteReader, Container, Conversion, Dataset, DatasetBuilder,
             DatasetBuilderData, DatasetBuilderEmpty, DatasetBuilderEmptyShape, Dataspace, Datatype,
             File, FileBuilder, Group, LinkInfo, LinkType, Location, LocationInfo, LocationToken,
-            LocationType, Object, OpenMode, PropertyList, Reader, Writer,
+            LocationType, Object, ObjectReference1, OpenMode, PropertyList, Reader,
+            ReferencedObject, Writer,
         },
     };
 
@@ -126,7 +140,11 @@ mod export {
     }
 }
 
+pub use crate::cache::{chunk_cache_size, set_chunk_cache_size, DEFAULT_CHUNK_CACHE};
 pub use crate::export::*;
+pub use crate::par::{
+    clear_thread_spawner, num_threads, set_num_threads, set_thread_spawner, Task,
+};
 
 #[macro_use]
 mod macros;
@@ -142,15 +160,19 @@ mod handle;
 pub mod sync;
 mod util;
 
+mod cache;
 #[doc(hidden)]
 pub mod format;
 #[doc(hidden)]
 pub mod h5i;
+mod lock;
 mod model;
+mod par;
 
 mod hl;
 #[cfg(feature = "mpi")]
 pub mod mpi;
+pub mod remote;
 
 /// Returns the runtime version of the (emulated) HDF5 library.
 ///

@@ -7,6 +7,7 @@ use crate::class::ObjectClass;
 use crate::error::Result;
 use crate::h5i::H5I_type_t;
 use crate::handle::{Handle, Payload};
+use crate::hl::attribute::Attribute;
 use crate::hl::dataset::{Dataset, DatasetBuilder, DatasetBuilderEmpty};
 use crate::hl::datatype::Datatype;
 use crate::hl::location::Location;
@@ -113,6 +114,7 @@ impl Group {
         let file = self.0.file().ok_or("group is not file-resident")?.clone();
         let start = self.0.obj_id().ok_or("group has no location")?;
         let mut state = file.state.write();
+        state.dirty = true;
         if state.read_only {
             return Err("unable to create group: file is read-only".into());
         }
@@ -213,6 +215,7 @@ impl Group {
         let file = self.0.file().ok_or("group is not file-resident")?.clone();
         let start = self.0.obj_id().ok_or("group has no location")?;
         let mut state = file.state.write();
+        state.dirty = true;
         if state.read_only {
             return Err("unable to modify links: file is read-only".into());
         }
@@ -256,6 +259,7 @@ impl Group {
         let file = self.0.file().ok_or("group is not file-resident")?.clone();
         let start = self.0.obj_id().ok_or("group has no location")?;
         let mut state = file.state.write();
+        state.dirty = true;
         if state.read_only {
             return Err("unable to relink: file is read-only".into());
         }
@@ -296,6 +300,7 @@ impl Group {
         let file = self.0.file().ok_or("group is not file-resident")?.clone();
         let start = self.0.obj_id().ok_or("group has no location")?;
         let mut state = file.state.write();
+        state.dirty = true;
         if state.read_only {
             return Err("unable to unlink: file is read-only".into());
         }
@@ -320,26 +325,92 @@ impl Group {
             (Some(f), Some(s)) => (f, s),
             _ => return false,
         };
-        let state = file.state.read();
-        // resolve all but last component, then check final link existence
-        match name.rfind('/') {
-            Some(pos) => {
-                let (dir, leaf) = name.split_at(pos);
-                let dir = if dir.is_empty() { "/" } else { dir };
-                state
-                    .resolve(start, dir)
-                    .and_then(|p| state.group_data(p))
-                    .map(|g| g.find(&leaf[1..]).is_some())
-                    .unwrap_or(false)
-            }
-            None => state
+        // resolve all but last component, then check final link existence; the
+        // walk forces lazy groups (a lazily opened file parses them on demand),
+        // the last component stays unresolved so a dangling link still exists
+        let mut state = file.state.write();
+        let (dir, leaf) = match name.rfind('/') {
+            Some(0) => ("/", &name[1..]),
+            Some(pos) => (&name[..pos], &name[pos + 1..]),
+            None => ("", name),
+        };
+        state
+            .resolve_force(start, dir)
+            .and_then(|p| state.group_data(p))
+            .map(|g| g.find(leaf).is_some())
+            .unwrap_or(false)
+    }
+
+    /// The attribute `attr` of the member `name`, without parsing the member:
+    /// on a lazily opened file, what a group is can be asked without paying to
+    /// walk its members, which may be scattered through gigabytes.
+    pub fn member_attr(&self, name: &str, attr: &str) -> Result<Attribute> {
+        let (file, start) = match (self.0.file(), self.0.obj_id()) {
+            (Some(f), Some(s)) => (f, s),
+            _ => return Err("group is not file-resident".into()),
+        };
+        let hard = {
+            let mut state = file.state.write();
+            state.force(start)?;
+            let link = state
                 .group_data(start)
-                .map(|g| g.find(name).is_some())
-                .unwrap_or(false),
-        }
+                .and_then(|g| g.find(name))
+                .ok_or_else(|| format!("object '{name}' not found"))?;
+            match link.target {
+                LinkTarget::Hard(id) => {
+                    crate::format::reader::peek_attrs(&mut state, id)?;
+                    let node = state.try_get(id).ok_or("dangling object")?;
+                    if node.attr_index(attr).is_none() {
+                        return Err(format!("unable to open attribute '{attr}'").into());
+                    }
+                    Some(id)
+                }
+                _ => None,
+            }
+        };
+        // anything but a hard link is followed the usual way, the lock let go
+        let Some(id) = hard else {
+            return self.open_by_path(name)?.attr(attr);
+        };
+        Ok(Attribute::from_handle(Handle::new(Payload::Attribute {
+            file: file.clone(),
+            owner: id,
+            name: attr.to_string(),
+        })))
     }
 
     /// Instantiates a typed dataset builder.
+    /// Creates a one-dimensional dataset of object references (`H5R_OBJECT`)
+    /// to `targets`, objects of this file — as NWB's columns of electrode
+    /// groups. Stored contiguously; written as each target's address.
+    pub fn new_reference_dataset(&self, name: &str, targets: &[&Location]) -> Result<Dataset> {
+        let file = self.handle().file().ok_or("not file-resident")?.clone();
+        let refs = targets
+            .iter()
+            .map(|t| {
+                let same = t
+                    .handle()
+                    .file()
+                    .is_some_and(|f| std::sync::Arc::ptr_eq(f, &file));
+                if !same {
+                    return Err("an object reference to another file".into());
+                }
+                t.handle()
+                    .obj_id()
+                    .ok_or_else(|| "a reference to an object without a location".into())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let ds = self
+            .new_dataset::<crate::hl::location::ObjectReference1>()
+            .shape([refs.len()])
+            .create(name)?;
+        let id = ds.handle().obj_id().ok_or("no location")?;
+        if let crate::model::ObjectKind::Dataset(d) = &mut file.state.write().get_mut(id).kind {
+            d.refs = Some(refs);
+        }
+        Ok(ds)
+    }
+
     pub fn new_dataset<T: H5Type>(&self) -> DatasetBuilderEmpty {
         self.new_dataset_builder().empty::<T>()
     }

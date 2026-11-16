@@ -8,6 +8,7 @@
 
 use super::{Cursor, UNDEF};
 use crate::error::Result;
+use crate::format::source::{ByteSource, MemSource};
 
 /// `H5VM_log2_gen`: floor(log2(n)) for n >= 1.
 fn log2_gen(n: u64) -> u32 {
@@ -44,8 +45,8 @@ struct B2Level {
 }
 
 /// Read and walk an entire v2 B-tree, returning its raw records in order.
-pub fn read_v2btree(data: &[u8], base: u64, hdr_addr: u64) -> Result<V2Btree> {
-    let mut c = Cursor::at(data, (base + hdr_addr) as usize);
+pub fn read_v2btree(src: &dyn ByteSource, base: u64, hdr_addr: u64) -> Result<V2Btree> {
+    let mut c = Cursor::at(src, base + hdr_addr);
     let sig = c.take(4)?;
     if sig != b"BTHD" {
         return Err("bad BTHD signature".into());
@@ -93,7 +94,7 @@ pub fn read_v2btree(data: &[u8], base: u64, hdr_addr: u64) -> Result<V2Btree> {
     let mut records = Vec::new();
     if root_addr != UNDEF && root_nrec > 0 {
         walk_b2_node(
-            data,
+            src,
             base,
             root_addr,
             root_nrec,
@@ -112,7 +113,7 @@ pub fn read_v2btree(data: &[u8], base: u64, hdr_addr: u64) -> Result<V2Btree> {
 
 #[allow(clippy::too_many_arguments)]
 fn walk_b2_node(
-    data: &[u8],
+    src: &dyn ByteSource,
     base: u64,
     addr: u64,
     nrec: u64,
@@ -122,7 +123,7 @@ fn walk_b2_node(
     levels: &[B2Level],
     out: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
-    let mut c = Cursor::at(data, (base + addr) as usize);
+    let mut c = Cursor::at(src, base + addr);
     let sig = c.take(4)?;
     let expected: &[u8] = if depth == 0 { b"BTLF" } else { b"BTIN" };
     if sig != expected {
@@ -140,16 +141,16 @@ fn walk_b2_node(
     // records first (nrec * rrec_size), then child pointers for internal nodes
     let rec_start = c.pos;
     let recs: Vec<Vec<u8>> = (0..nrec)
-        .map(|i| {
-            let s = rec_start + (i as usize) * rrec_size;
-            data[s..s + rrec_size].to_vec()
+        .map(|i| -> Result<Vec<u8>> {
+            let s = rec_start + i * rrec_size as u64;
+            Ok(src.slice(s, rrec_size)?.to_vec())
         })
-        .collect();
+        .collect::<Result<_>>()?;
     if depth == 0 {
         out.extend(recs);
         return Ok(());
     }
-    c.seek(rec_start + (nrec as usize) * rrec_size);
+    c.seek(rec_start + nrec * rrec_size as u64);
     // nrec+1 child pointers to depth-1 nodes
     let child_level = &levels[depth - 1];
     let nrec_size = limit_enc_size(child_level.max_nrec);
@@ -166,7 +167,7 @@ fn walk_b2_node(
     // in-order traversal: child0, rec0, child1, rec1, ..., recN-1, childN
     for (i, (caddr, cnrec)) in children.iter().enumerate() {
         walk_b2_node(
-            data,
+            src,
             base,
             *caddr,
             *cnrec,
@@ -189,7 +190,7 @@ fn walk_b2_node(
 
 /// A parsed fractal heap, sufficient to fetch managed and tiny objects.
 pub struct FractalHeap<'a> {
-    data: &'a [u8],
+    src: &'a dyn ByteSource,
     base: u64,
     pub id_len: usize,
     #[allow(dead_code)] // parsed for completeness; direct-block checksums are skipped over
@@ -213,8 +214,8 @@ pub struct FractalHeap<'a> {
 }
 
 impl<'a> FractalHeap<'a> {
-    pub fn parse(data: &'a [u8], base: u64, addr: u64) -> Result<Self> {
-        let mut c = Cursor::at(data, (base + addr) as usize);
+    pub fn parse(src: &'a dyn ByteSource, base: u64, addr: u64) -> Result<Self> {
+        let mut c = Cursor::at(src, base + addr);
         let sig = c.take(4)?;
         if sig != b"FRHP" {
             return Err("bad FRHP signature".into());
@@ -251,7 +252,7 @@ impl<'a> FractalHeap<'a> {
         let (root_filtered_size, root_filter_mask, filters) = if io_filter_len > 0 {
             let sz = c.u64()?;
             let mask = c.u32()?;
-            let mut pc = Cursor::at(c.data, c.pos);
+            let mut pc = Cursor::at(c.src, c.pos);
             let filters = crate::format::reader::parse_filter_pipeline_public(&mut pc)?;
             (sz, mask, filters)
         } else {
@@ -270,7 +271,7 @@ impl<'a> FractalHeap<'a> {
             id_len.saturating_sub(1).min(8)
         };
         Ok(Self {
-            data,
+            src,
             base,
             id_len,
             checksum_dblocks: flags & 0x02 != 0,
@@ -293,19 +294,24 @@ impl<'a> FractalHeap<'a> {
 
     /// Fetch and (when the heap is filtered) decompress one direct block.
     fn dblock_bytes(&self, addr: u64, stored: u64, mask: u32, plain_size: u64) -> Result<Vec<u8>> {
-        let start = (self.base + addr) as usize;
+        let start = self.base + addr;
         if self.filters.is_empty() {
-            let end = start + plain_size as usize;
-            if end > self.data.len() {
+            let end = start + plain_size;
+            if end > self.src.len() {
                 return Err("fractal heap block out of bounds".into());
             }
-            Ok(self.data[start..end].to_vec())
+            Ok(self.src.slice(start, plain_size as usize)?.to_vec())
         } else {
-            let end = start + stored as usize;
-            if end > self.data.len() {
+            let end = start + stored;
+            if end > self.src.len() {
                 return Err("fractal heap block out of bounds".into());
             }
-            crate::format::filters::reverse_masked(&self.filters, 1, &self.data[start..end], mask)
+            crate::format::filters::reverse_masked(
+                &self.filters,
+                1,
+                self.src.slice(start, stored as usize)?,
+                mask,
+            )
         }
     }
 
@@ -362,7 +368,7 @@ impl<'a> FractalHeap<'a> {
         iblock_off: u64,
         off: u64,
     ) -> Result<(u64, u64, u64, u32)> {
-        let mut c = Cursor::at(self.data, (self.base + iblock_addr) as usize);
+        let mut c = Cursor::at(self.src, self.base + iblock_addr);
         let sig = c.take(4)?;
         if sig != b"FHIB" {
             return Err("bad FHIB signature".into());
@@ -386,7 +392,7 @@ impl<'a> FractalHeap<'a> {
             8 + 8 + 4
         };
         if row < max_direct_rows {
-            let mut ec = Cursor::at(self.data, entries_start + entry * dstride);
+            let mut ec = Cursor::at(self.src, entries_start + (entry * dstride) as u64);
             let dblock_addr = ec.addr()?;
             let (fsize, fmask) = if self.filters.is_empty() {
                 (0, 0)
@@ -403,7 +409,10 @@ impl<'a> FractalHeap<'a> {
             // indirect-block entry: skip the direct entries, then indirect addrs
             let ndirect = max_direct_rows.min(nrows) * self.table_width;
             let ientry = entry - ndirect;
-            let mut ec = Cursor::at(self.data, entries_start + ndirect * dstride + ientry * 8);
+            let mut ec = Cursor::at(
+                self.src,
+                entries_start + (ndirect * dstride) as u64 + (ientry * 8) as u64,
+            );
             let child_addr = ec.addr()?;
             if child_addr == UNDEF {
                 return Err("fractal heap indirect block not allocated".into());
@@ -435,7 +444,8 @@ impl<'a> FractalHeap<'a> {
         match id_type {
             0 => {
                 // managed
-                let mut c = Cursor::new(&id[1..]);
+                let __ms = MemSource::new(&id[1..]);
+                let mut c = Cursor::new(&__ms);
                 let off = c.uint(self.heap_off_size)?;
                 let len = c.uint(self.heap_len_size)? as usize;
                 let (dblock_addr, dblock_off, fsize, fmask) = self.locate_dblock(off)?;
@@ -443,11 +453,11 @@ impl<'a> FractalHeap<'a> {
                 // space, which *includes* each block's prefix bytes
                 // (H5HF__man_op_real: data = block image + (obj_off - block_off)).
                 if self.filters.is_empty() {
-                    let start = (self.base + dblock_addr + (off - dblock_off)) as usize;
-                    if start + len > self.data.len() {
+                    let start = self.base + dblock_addr + (off - dblock_off);
+                    if start + len as u64 > self.src.len() {
                         return Err("fractal heap object out of bounds".into());
                     }
-                    Ok(self.data[start..start + len].to_vec())
+                    Ok(self.src.slice(start, len)?.to_vec())
                 } else {
                     // decompress the whole block, then slice the object
                     let block =
@@ -470,7 +480,8 @@ impl<'a> FractalHeap<'a> {
             1 => {
                 // huge object (H5HFhuge.c): either the id embeds {addr, len}
                 // directly, or it names a record in the huge v2 btree
-                let mut c = Cursor::new(&id[1..]);
+                let __ms = MemSource::new(&id[1..]);
+                let mut c = Cursor::new(&__ms);
                 let (addr, len) = if self.huge_ids_direct {
                     (c.addr()?, c.u64()? as usize)
                 } else {
@@ -478,7 +489,7 @@ impl<'a> FractalHeap<'a> {
                     if self.huge_bt2_addr == UNDEF {
                         return Err("huge object btree missing".into());
                     }
-                    let bt = read_v2btree(self.data, self.base, self.huge_bt2_addr)?;
+                    let bt = read_v2btree(self.src, self.base, self.huge_bt2_addr)?;
                     if bt.btree_type != 1 {
                         return Err(format!(
                             "unsupported huge-object btree type {}",
@@ -489,7 +500,8 @@ impl<'a> FractalHeap<'a> {
                     // record: {addr(8), len(8), id(8)}
                     let mut found = None;
                     for rec in &bt.records {
-                        let mut rc = Cursor::new(rec);
+                        let __ms1 = MemSource::new(rec);
+                        let mut rc = Cursor::new(&__ms1);
                         let addr = rc.addr()?;
                         let len = rc.u64()?;
                         let rec_id = rc.u64()?;
@@ -500,11 +512,11 @@ impl<'a> FractalHeap<'a> {
                     }
                     found.ok_or("huge object id not found in btree")?
                 };
-                let start = (self.base + addr) as usize;
-                if start + len > self.data.len() {
+                let start = self.base + addr;
+                if start + len as u64 > self.src.len() {
                     return Err("huge object out of bounds".into());
                 }
-                Ok(self.data[start..start + len].to_vec())
+                Ok(self.src.slice(start, len)?.to_vec())
             }
             _ => Err("unknown fractal heap id type".into()),
         }
@@ -517,7 +529,7 @@ impl<'a> FractalHeap<'a> {
 
 /// A parsed extensible array header plus lookup machinery.
 pub struct ExtensibleArray<'a> {
-    data: &'a [u8],
+    src: &'a dyn ByteSource,
     base: u64,
     pub elmt_size: usize,
     idx_blk_elmts: usize,
@@ -542,8 +554,8 @@ struct SblkInfo {
 }
 
 impl<'a> ExtensibleArray<'a> {
-    pub fn parse(data: &'a [u8], base: u64, addr: u64) -> Result<Self> {
-        let mut c = Cursor::at(data, (base + addr) as usize);
+    pub fn parse(src: &'a dyn ByteSource, base: u64, addr: u64) -> Result<Self> {
+        let mut c = Cursor::at(src, base + addr);
         let sig = c.take(4)?;
         if sig != b"EAHD" {
             return Err("bad EAHD signature".into());
@@ -588,7 +600,7 @@ impl<'a> ExtensibleArray<'a> {
         }
 
         Ok(Self {
-            data,
+            src,
             base,
             elmt_size,
             idx_blk_elmts,
@@ -623,8 +635,8 @@ impl<'a> ExtensibleArray<'a> {
         if self.index_blk_addr == UNDEF {
             return Ok(None);
         }
-        let ib_pos = (self.base + self.index_blk_addr) as usize;
-        let mut c = Cursor::at(self.data, ib_pos);
+        let ib_pos = self.base + self.index_blk_addr;
+        let mut c = Cursor::at(self.src, ib_pos);
         let sig = c.take(4)?;
         if sig != b"EAIB" {
             return Err("bad EAIB signature".into());
@@ -633,12 +645,12 @@ impl<'a> ExtensibleArray<'a> {
         let _cls = c.u8()?;
         let _hdr = c.addr()?;
         let elmts_start = c.pos;
-        let dblk_addrs_start = elmts_start + self.idx_blk_elmts * self.elmt_size;
-        let sblk_addrs_start = dblk_addrs_start + self.iblock_ndblk_addrs() * 8;
+        let dblk_addrs_start = elmts_start + (self.idx_blk_elmts * self.elmt_size) as u64;
+        let sblk_addrs_start = dblk_addrs_start + (self.iblock_ndblk_addrs() * 8) as u64;
 
         if (idx as usize) < self.idx_blk_elmts {
-            let s = elmts_start + (idx as usize) * self.elmt_size;
-            return Ok(Some(self.data[s..s + self.elmt_size].to_vec()));
+            let s = elmts_start + idx * self.elmt_size as u64;
+            return Ok(Some(self.src.slice(s, self.elmt_size)?.to_vec()));
         }
         let elmt_idx = idx - self.idx_blk_elmts as u64;
         let sblk_idx = log2_gen(elmt_idx / self.data_blk_min_elmts as u64 + 1) as usize;
@@ -652,7 +664,7 @@ impl<'a> ExtensibleArray<'a> {
         if sblk_idx < self.iblock_nsblks() {
             // data block addressed directly from the index block
             let dblk_idx = info.start_dblk as usize + (within / dblk_nelmts as u64) as usize;
-            let mut ac = Cursor::at(self.data, dblk_addrs_start + dblk_idx * 8);
+            let mut ac = Cursor::at(self.src, dblk_addrs_start + (dblk_idx * 8) as u64);
             let dblk_addr = ac.addr()?;
             if dblk_addr == UNDEF {
                 return Ok(None);
@@ -665,12 +677,12 @@ impl<'a> ExtensibleArray<'a> {
         } else {
             // data block inside a super block
             let sblk_slot = sblk_idx - self.iblock_nsblks();
-            let mut ac = Cursor::at(self.data, sblk_addrs_start + sblk_slot * 8);
+            let mut ac = Cursor::at(self.src, sblk_addrs_start + (sblk_slot * 8) as u64);
             let sblk_addr = ac.addr()?;
             if sblk_addr == UNDEF {
                 return Ok(None);
             }
-            let mut sc = Cursor::at(self.data, (self.base + sblk_addr) as usize);
+            let mut sc = Cursor::at(self.src, self.base + sblk_addr);
             let sig = sc.take(4)?;
             if sig != b"EASB" {
                 return Err("bad EASB signature".into());
@@ -687,9 +699,9 @@ impl<'a> ExtensibleArray<'a> {
                 0
             };
             let page_init_size = if paged { npages.div_ceil(8) } else { 0 };
-            let dblk_addrs_pos = sc.pos + info.ndblks * page_init_size;
+            let dblk_addrs_pos = sc.pos + (info.ndblks * page_init_size) as u64;
             let dblk_idx = (within / dblk_nelmts as u64) as usize;
-            let mut ac = Cursor::at(self.data, dblk_addrs_pos + dblk_idx * 8);
+            let mut ac = Cursor::at(self.src, dblk_addrs_pos + (dblk_idx * 8) as u64);
             let dblk_addr = ac.addr()?;
             if dblk_addr == UNDEF {
                 return Ok(None);
@@ -708,7 +720,7 @@ impl<'a> ExtensibleArray<'a> {
         nelmts: usize,
         elmt_idx: usize,
     ) -> Result<Option<Vec<u8>>> {
-        let mut c = Cursor::at(self.data, (self.base + dblk_addr) as usize);
+        let mut c = Cursor::at(self.src, self.base + dblk_addr);
         let sig = c.take(4)?;
         if sig != b"EADB" {
             return Err("bad EADB signature".into());
@@ -719,11 +731,11 @@ impl<'a> ExtensibleArray<'a> {
         let _block_off = c.uint(self.arr_off_size)?;
         let paged = nelmts > self.dblk_page_nelmts();
         if !paged {
-            let s = c.pos + elmt_idx * self.elmt_size;
-            if s + self.elmt_size > self.data.len() {
+            let s = c.pos + (elmt_idx * self.elmt_size) as u64;
+            if s + self.elmt_size as u64 > self.src.len() {
                 return Err("extensible array element out of bounds".into());
             }
-            Ok(Some(self.data[s..s + self.elmt_size].to_vec()))
+            Ok(Some(self.src.slice(s, self.elmt_size)?.to_vec()))
         } else {
             // paged: prefix is followed by its checksum, then fixed-size pages
             // of (page_nelmts * elmt_size + checksum) each
@@ -732,11 +744,11 @@ impl<'a> ExtensibleArray<'a> {
             let page_size = page_nelmts * self.elmt_size + 4;
             let page_idx = elmt_idx / page_nelmts;
             let within = elmt_idx % page_nelmts;
-            let s = pages_start + page_idx * page_size + within * self.elmt_size;
-            if s + self.elmt_size > self.data.len() {
+            let s = pages_start + (page_idx * page_size) as u64 + (within * self.elmt_size) as u64;
+            if s + self.elmt_size as u64 > self.src.len() {
                 return Err("extensible array element out of bounds".into());
             }
-            Ok(Some(self.data[s..s + self.elmt_size].to_vec()))
+            Ok(Some(self.src.slice(s, self.elmt_size)?.to_vec()))
         }
     }
 }

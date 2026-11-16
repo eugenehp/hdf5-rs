@@ -40,16 +40,51 @@ impl std::fmt::Debug for FileImage {
     }
 }
 
-/// Deferred dataset bytes: references into the file image, loaded on first
-/// access so opening a file costs metadata only.
-#[derive(Clone, Debug)]
+/// Deferred dataset bytes: read from the backing [`ByteSource`] on first access
+/// so opening a file costs metadata only. The source may be a fully-present
+/// image (mmap/bytes) or a lazy range-reader, so this works identically for
+/// local and streamed files.
+/// A zeroed buffer of `n` bytes, or an error when it cannot be had: sizes
+/// here come from the file, and a damaged one must not abort the process.
+pub(crate) fn zeroed(n: usize) -> crate::error::Result<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n)
+        .map_err(|_| format!("not enough memory for {n} bytes; read it in parts"))?;
+    v.resize(n, 0);
+    Ok(v)
+}
+
+/// A dataset's chunks, shared between readers.
+pub type ChunkList = std::sync::Arc<Vec<crate::format::reader::ChunkEntry>>;
+
+#[derive(Clone)]
 pub struct LazyData {
-    pub image: std::sync::Arc<FileImage>,
+    pub src: std::sync::Arc<dyn crate::format::source::ByteSource + Send + Sync>,
     /// File base address (superblock offset).
     pub base: u64,
     /// Logical dataset size in bytes (output buffer size).
-    pub logical: usize,
+    pub logical: u64,
     pub kind: LazyKind,
+    /// The walked chunk index `(offsets, size, filter_mask, addr)`, memoized by
+    /// the first read that needs all of it, so random access does not re-walk
+    /// the index per call. Chunks written since the file was opened (see
+    /// [`LazyData::write_pick`]) are only here — the on-disk index is
+    /// rewritten at the next flush.
+    pub resolved_chunks: std::sync::Arc<crate::lock::RwLock<Option<ChunkList>>>,
+    /// Big-endian on disk: the width to reverse as read, else 0.
+    pub swap: usize,
+    /// Decoded chunks kept between partial reads.
+    pub cache: std::sync::Arc<crate::cache::ChunkCache>,
+}
+
+impl std::fmt::Debug for LazyData {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("LazyData")
+            .field("base", &self.base)
+            .field("logical", &self.logical)
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 /// What must be done to materialize the deferred bytes.
@@ -57,12 +92,13 @@ pub struct LazyData {
 pub enum LazyKind {
     /// One contiguous run: `image[offset..offset + len]`, zero-padded to
     /// `logical`.
-    Contiguous { offset: usize, len: usize },
-    /// Chunked storage: every chunk is decoded through the filter pipeline
-    /// and scattered into place on first access.
+    Contiguous { offset: u64, len: u64 },
+    /// Chunked storage: the chunk *index* is walked, then every chunk decoded
+    /// through the filter pipeline and scattered into place — all on first
+    /// access. Storing the index descriptor (not the walked chunk list) means
+    /// opening a file never enumerates chunks.
     Chunked {
-        /// (chunk offsets, stored size, filter mask, address) per chunk.
-        chunks: Vec<(Vec<u64>, u32, u32, u64)>,
+        index: crate::format::reader::ChunkIndex,
         dims: Vec<u64>,
         chunk_dims: Vec<u64>,
         elem_size: usize,
@@ -71,30 +107,397 @@ pub enum LazyKind {
 }
 
 impl LazyData {
-    /// Load the deferred bytes into a fresh logical buffer.
-    pub fn materialize_bytes(&self) -> crate::error::Result<Vec<u8>> {
-        let data: &[u8] = &self.image;
+    /// Bytes of rows `[r0, r1)` along the leading axis, decoding ONLY the
+    /// chunks that overlap them (the full-dataset path decodes every chunk).
+    /// `row_bytes` = element size × product of the trailing dims.
+    pub fn materialize_rows(
+        &self,
+        r0: u64,
+        r1: u64,
+        row_bytes: usize,
+    ) -> crate::error::Result<Vec<u8>> {
+        self.native(self.stored_rows(r0, r1, row_bytes)?)
+    }
+
+    /// `bytes` in the order the model holds: little-endian.
+    fn native(&self, mut bytes: Vec<u8>) -> crate::error::Result<Vec<u8>> {
+        self.swap_in_place(&mut bytes);
+        Ok(bytes)
+    }
+
+    fn swap_in_place(&self, bytes: &mut [u8]) {
+        if self.swap > 1 {
+            let width = self.swap;
+            crate::par::units_mut(bytes, width, |part| {
+                crate::format::simd::swap_bytes(width, part)
+            });
+        }
+    }
+
+    /// The whole dataset, into `out` (zeroed, of the logical size): nothing is
+    /// kept here, and nothing copied twice.
+    pub fn materialize_into(&self, out: &mut [u8]) -> crate::error::Result<()> {
+        // big-endian numbers: swapped as they are placed, not in a second pass
+        if self.swap > 1 {
+            let copy = |s: &[u8], d: &mut [u8]| d.copy_from_slice(s);
+            if self.materialize_converted(out, self.swap, self.swap, &copy)? {
+                return Ok(());
+            }
+        }
+        let src: &dyn crate::format::source::ByteSource = &*self.src;
         match &self.kind {
             LazyKind::Contiguous { offset, len } => {
-                let mut v = Vec::with_capacity(self.logical);
-                v.extend_from_slice(&data[*offset..*offset + *len]);
-                v.resize(self.logical, 0);
-                Ok(v)
+                let n = (*len).min(out.len() as u64) as usize;
+                // spread over cores: from an mmap, the page faults are most of it
+                crate::par::zip_units(src.slice(*offset, n)?, 1, &mut out[..n], 1, |s, d| {
+                    d.copy_from_slice(s)
+                });
             }
             LazyKind::Chunked {
-                chunks,
                 dims,
                 chunk_dims,
                 elem_size,
                 filters,
+                ..
             } => {
-                let mut out = vec![0u8; self.logical];
+                let chunks = self.chunk_list()?;
                 crate::format::reader::materialize_chunks(
-                    data, self.base, chunks, dims, chunk_dims, *elem_size, filters, &mut out,
+                    src, self.base, &chunks, dims, chunk_dims, *elem_size, filters, out,
+                )?;
+            }
+        }
+        self.swap_in_place(out);
+        Ok(())
+    }
+
+    /// The whole dataset into `out` as elements of `out_es` bytes, each run
+    /// of stored elements (`es` bytes, little-endian) passed through `conv`
+    /// as it is placed — decode, byte-swap and conversion in one pass, with
+    /// no intermediate copy of the dataset. `false` (and `out` untouched)
+    /// where that would be slower: chunks whose rows are only a few elements
+    /// wide, where a per-run call would cost more than a second pass.
+    pub fn materialize_converted(
+        &self,
+        out: &mut [u8],
+        es: usize,
+        out_es: usize,
+        conv: &(dyn Fn(&[u8], &mut [u8]) + Sync),
+    ) -> crate::error::Result<bool> {
+        let swap = self.swap;
+        // big-endian: swap a stack buffer's worth at a time, then convert
+        let swapped = |s: &[u8], d: &mut [u8]| {
+            let mut tmp = [0u8; 4096];
+            let step = (4096 / es).max(1) * es;
+            for (sc, dc) in s.chunks(step).zip(d.chunks_mut(step / es * out_es)) {
+                let t = &mut tmp[..sc.len()];
+                t.copy_from_slice(sc);
+                crate::format::simd::swap_bytes(swap, t);
+                conv(t, dc);
+            }
+        };
+        let f: &(dyn Fn(&[u8], &mut [u8]) + Sync) = if swap > 1 { &swapped } else { conv };
+        let src: &dyn crate::format::source::ByteSource = &*self.src;
+        match &self.kind {
+            LazyKind::Contiguous { offset, len } => {
+                let n = (*len).min(self.logical) as usize / es * es;
+                let stored = src.slice(*offset, n)?;
+                crate::par::zip_units(stored, es, &mut out[..n / es * out_es], out_es, f);
+            }
+            LazyKind::Chunked {
+                dims,
+                chunk_dims,
+                elem_size,
+                filters,
+                ..
+            } => {
+                if chunk_dims.last().is_some_and(|&run| run < 16) || *elem_size != es {
+                    return Ok(false);
+                }
+                let chunks = self.chunks_for_rows(0, dims.first().copied().unwrap_or(1))?;
+                crate::format::reader::materialize_chunks_with(
+                    src,
+                    self.base,
+                    &chunks,
+                    dims,
+                    chunk_dims,
+                    *elem_size,
+                    filters,
+                    out,
+                    Some((out_es, f)),
+                )?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn stored_rows(&self, r0: u64, r1: u64, row_bytes: usize) -> crate::error::Result<Vec<u8>> {
+        let src: &dyn crate::format::source::ByteSource = &*self.src;
+        let n = (r1 - r0) as usize * row_bytes;
+        match &self.kind {
+            LazyKind::Contiguous { offset, len } => {
+                let mut v = zeroed(n)?;
+                let start = r0 * row_bytes as u64;
+                if start < *len {
+                    // no more than n, which is a usize
+                    let take = (*len - start).min(n as u64) as usize;
+                    v[..take].copy_from_slice(src.slice(*offset + start, take)?);
+                }
+                Ok(v)
+            }
+            LazyKind::Chunked {
+                dims,
+                chunk_dims,
+                elem_size,
+                filters,
+                ..
+            } => {
+                let rank = dims.len();
+                let c0 = chunk_dims.first().copied().unwrap_or(1);
+                let chunks = self.chunks_for_rows(r0, r1)?;
+                let wanted: Vec<crate::format::reader::ChunkEntry> = chunks
+                    .iter()
+                    .filter(|(off, ..)| rank > 0 && off[0] < r1 && off[0] + c0 > r0)
+                    .cloned()
+                    .collect();
+                let mut out = zeroed(n)?;
+                crate::format::reader::materialize_chunk_rows(
+                    src,
+                    self.base,
+                    &wanted,
+                    dims,
+                    chunk_dims,
+                    *elem_size,
+                    filters,
+                    r0,
+                    r1,
+                    &mut out,
+                    Some(&self.cache),
                 )?;
                 Ok(out)
             }
         }
+    }
+
+    /// The walked chunk index, or just the part covering rows `[r0, r1)`
+    /// where the index allows a partial walk (and the whole index is not yet
+    /// memoized).
+    fn chunks_for_rows(&self, r0: u64, r1: u64) -> crate::error::Result<ChunkList> {
+        let LazyKind::Chunked {
+            index,
+            dims,
+            chunk_dims,
+            ..
+        } = &self.kind
+        else {
+            return Ok(Default::default());
+        };
+        if let Some(c) = &*self.resolved_chunks.read() {
+            return Ok(c.clone());
+        }
+        let src: &dyn crate::format::source::ByteSource = &*self.src;
+        if !dims.is_empty() {
+            if let Some(part) = crate::format::reader::resolve_chunk_rows(
+                src,
+                self.base,
+                index,
+                dims.len(),
+                (r0, r1, chunk_dims[0]),
+            )? {
+                return Ok(std::sync::Arc::new(part));
+            }
+        }
+        self.chunk_list()
+    }
+
+    /// Every stored chunk, walking the index the first time.
+    pub fn chunk_list(&self) -> crate::error::Result<ChunkList> {
+        let LazyKind::Chunked {
+            index,
+            dims,
+            chunk_dims,
+            elem_size,
+            ..
+        } = &self.kind
+        else {
+            return Ok(Default::default());
+        };
+        let mut memo = self.resolved_chunks.write();
+        if let Some(c) = &*memo {
+            return Ok(c.clone());
+        }
+        let src: &dyn crate::format::source::ByteSource = &*self.src;
+        let c = std::sync::Arc::new(crate::format::reader::resolve_chunks(
+            src, self.base, index, dims, chunk_dims, *elem_size,
+        )?);
+        *memo = Some(c.clone());
+        Ok(c)
+    }
+
+    /// The elements `pick` selects, packed in pick order (little-endian),
+    /// reading only the stored runs or chunks they lie in. `dims` are the
+    /// dataset's.
+    pub(crate) fn pick(
+        &self,
+        dims: &[u64],
+        elem_size: usize,
+        pick: &crate::format::reader::Pick,
+    ) -> crate::error::Result<Vec<u8>> {
+        let src: &dyn crate::format::source::ByteSource = &*self.src;
+        let bytes = pick
+            .len()
+            .checked_mul(elem_size)
+            .ok_or("selection too large")?;
+        let mut out = zeroed(bytes)?;
+        match &self.kind {
+            LazyKind::Contiguous { offset, len } => {
+                crate::format::reader::contiguous_pick_into(
+                    src,
+                    (*offset, *len),
+                    dims,
+                    elem_size,
+                    pick,
+                    &mut out,
+                )?;
+            }
+            LazyKind::Chunked {
+                dims,
+                chunk_dims,
+                elem_size,
+                filters,
+                ..
+            } => {
+                let (r0, r1) = pick.row_span().unwrap_or((0, 0));
+                let chunks = self.chunks_for_rows(r0, r1)?;
+                let cs = crate::format::reader::ChunkSource {
+                    src,
+                    base: self.base,
+                    dims,
+                    chunk_dims,
+                    elem_size: *elem_size,
+                    filters,
+                    cache: Some(&self.cache),
+                };
+                crate::format::reader::chunks_pick_into(&cs, &chunks, pick, &mut out)?;
+            }
+        }
+        self.native(out)
+    }
+
+    /// Write `values` (stored layout, little-endian, in pick order) into the
+    /// picked elements, straight to `file`: only the chunks the pick touches
+    /// are decoded, updated and appended; the chunk list here is updated, and
+    /// the on-disk index is rewritten at the next flush. Chunked data only.
+    pub(crate) fn write_pick(
+        &self,
+        file: &crate::format::source::FileSource,
+        pick: &crate::format::reader::Pick,
+        values: &[u8],
+        fill: &[u8],
+    ) -> crate::error::Result<()> {
+        let LazyKind::Chunked {
+            dims,
+            chunk_dims,
+            elem_size,
+            filters,
+            ..
+        } = &self.kind
+        else {
+            return Err("write_pick: not chunked".into());
+        };
+        let chunks = self.chunk_list()?;
+        let cs = crate::format::reader::ChunkSource {
+            src: &*self.src,
+            base: self.base,
+            dims,
+            chunk_dims,
+            elem_size: *elem_size,
+            filters,
+            cache: Some(&self.cache),
+        };
+        let base = self.base;
+        let mut append =
+            |bytes: &[u8]| -> crate::error::Result<u64> { Ok(file.append(bytes)? - base) };
+        let written = crate::format::reader::chunks_write_pick(
+            &cs,
+            &chunks,
+            pick,
+            values,
+            fill,
+            &mut append,
+        )?;
+        drop(chunks);
+        // merge: a rewritten chunk replaces its old entry, a new one is added
+        let rank = dims.len();
+        let mut memo = self.resolved_chunks.write();
+        let list = std::sync::Arc::make_mut(memo.get_or_insert_with(Default::default));
+        let mut at: std::collections::HashMap<Vec<u64>, usize> = list
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.0[..rank].to_vec(), i))
+            .collect();
+        for entry in written {
+            let key = entry.0[..rank].to_vec();
+            match at.get(&key) {
+                Some(&i) => list[i] = entry,
+                None => {
+                    at.insert(key, list.len());
+                    list.push(entry);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The dataset reshaped to `dims` without reading it: its chunks stay
+    /// where they are (the list is walked first, as some indexes are laid out
+    /// by the old shape); new regions read as fill until written.
+    pub(crate) fn resized(&self, dims: &[u64]) -> crate::error::Result<Self> {
+        let LazyKind::Chunked {
+            index,
+            chunk_dims,
+            elem_size,
+            filters,
+            ..
+        } = &self.kind
+        else {
+            return Err("resized: not chunked".into());
+        };
+        let chunks = self.chunk_list()?;
+        Ok(Self {
+            logical: dims.iter().product::<u64>() * *elem_size as u64,
+            kind: LazyKind::Chunked {
+                index: index.clone(),
+                dims: dims.to_vec(),
+                chunk_dims: chunk_dims.clone(),
+                elem_size: *elem_size,
+                filters: filters.clone(),
+            },
+            resolved_chunks: std::sync::Arc::new(crate::lock::RwLock::new(Some(chunks))),
+            ..self.clone()
+        })
+    }
+
+    /// The dataset's size where it must fit in memory at once.
+    fn logical_in_memory(&self) -> crate::error::Result<usize> {
+        usize::try_from(self.logical)
+            .map_err(|_| format!("dataset too large to load here ({} bytes)", self.logical).into())
+    }
+
+    /// Load the deferred bytes into a fresh logical buffer.
+    pub fn materialize_bytes(&self) -> crate::error::Result<Vec<u8>> {
+        self.stored_bytes()
+    }
+
+    fn stored_bytes(&self) -> crate::error::Result<Vec<u8>> {
+        let n = self.logical_in_memory()?;
+        // a dataset bigger than memory is an error to read whole, not an abort
+        let mut out = Vec::new();
+        out.try_reserve_exact(n).map_err(|_| {
+            format!("not enough memory to read {n} bytes at once; read it in parts")
+        })?;
+        out.resize(n, 0);
+        self.materialize_into(&mut out)?;
+        Ok(out)
     }
 }
 
@@ -148,15 +551,55 @@ pub struct Link {
 pub struct GroupData {
     pub links: Vec<Link>,
     pub track_order: bool,
+    index: NameIndex,
+}
+
+/// Members a group has before a name is looked up in an index, not by scanning.
+const INDEXED_LINKS: usize = 32;
+
+/// Link names to their place in `links`, built on the first lookup. `links` is
+/// changed freely, so the index is only ever a hint: a hit is checked against
+/// the link it names, and a miss falls back to scanning.
+#[derive(Default)]
+struct NameIndex(crate::lock::RwLock<Option<bbtree::unsync::BBTreeMap<String, u32>>>);
+
+impl Clone for NameIndex {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for NameIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("NameIndex")
+    }
 }
 
 impl GroupData {
     pub fn find(&self, name: &str) -> Option<&Link> {
-        self.links.iter().find(|l| l.name == name)
+        self.find_index(name).map(|i| &self.links[i])
     }
 
     pub fn find_index(&self, name: &str) -> Option<usize> {
-        self.links.iter().position(|l| l.name == name)
+        if self.links.len() >= INDEXED_LINKS {
+            let hit = match &*self.index.0.read() {
+                Some(names) => names.get(name).map(|i| *i as usize),
+                None => None,
+            };
+            if let Some(i) = hit.filter(|i| self.links.get(*i).is_some_and(|l| l.name == name)) {
+                return Some(i);
+            }
+        }
+        let found = self.links.iter().position(|l| l.name == name);
+        if self.links.len() >= INDEXED_LINKS && found.is_some() {
+            // not there, or stale: this group's links have changed since
+            let mut names = bbtree::unsync::BBTreeMap::new();
+            for (i, link) in self.links.iter().enumerate().rev() {
+                names.insert(link.name.clone(), i as u32);
+            }
+            *self.index.0.write() = Some(names);
+        }
+        found
     }
 }
 
@@ -179,6 +622,9 @@ pub struct DatasetData {
     pub lazy: Option<LazyData>,
     pub is_scalar: bool,
     pub is_null: bool,
+    /// Object references: the objects whose addresses are written in place
+    /// of `data`, under the reference datatype (`H5R_OBJECT`).
+    pub refs: Option<Vec<ObjId>>,
 }
 
 impl DatasetData {
@@ -239,6 +685,9 @@ pub struct AttrData {
     pub data: Vec<u8>,
     /// Side store for variable-length payloads (1-based indices).
     pub vlen: crate::format::convert::VlenStore,
+    /// Object references: the objects whose addresses are written in place
+    /// of `data`, under the reference datatype (`H5R_OBJECT`).
+    pub refs: Option<Vec<ObjId>>,
 }
 
 impl AttrData {
@@ -270,18 +719,23 @@ impl AttrData {
 }
 
 /// The kind of an object stored in the arena.
-// group/dataset payloads legitimately differ in size; boxing would ripple
-// through every accessor for no measurable gain
-#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum ObjectKind {
     Group(GroupData),
-    Dataset(DatasetData),
+    /// Boxed: a dataset's description is ~5× a group's, and every arena slot
+    /// (most of them lazy stubs, in a big file) would otherwise be that size.
+    Dataset(Box<DatasetData>),
     NamedType(TypeDescriptor),
     /// An object present in the file but not parseable by this build; the
     /// string holds the reason. Accessing it errors; writing a file that
     /// contains one errors (preventing silent data loss on rewrite).
     Unsupported(String),
+    /// A not-yet-parsed object in a lazily-opened file, identified by its
+    /// object-header address. Replaced in place by the real kind on first
+    /// navigation (see [`FileState::force`]).
+    Lazy {
+        oh_addr: u64,
+    },
 }
 
 /// A single object in the arena, with its attributes.
@@ -325,6 +779,20 @@ pub struct FileState {
     /// SOHM configuration: (message-type flag bits, min message size) per
     /// index; empty = no shared-message tables.
     pub sohm: Vec<(u16, u32)>,
+    /// Present for lazily-opened files: parses further objects on demand.
+    /// `None` for eager/writable files.
+    pub loader: Option<std::sync::Arc<crate::format::reader::LazyLoader>>,
+    /// Object-header address -> object id, for resolving HDF5 object
+    /// references. A reference token *is* an address, so without this a
+    /// dereference has no way back to the object the parser already built.
+    pub addrs: crate::util::AddrMap<u64, ObjId>,
+    /// The file on disk, for a writable path-backed file: flushes append to
+    /// it, and chunk writes go straight to it (see
+    /// [`crate::format::flush_append`]).
+    pub appendable: Option<std::sync::Arc<crate::format::source::FileSource>>,
+    /// Changed since it was opened or last flushed: a clean file is not
+    /// written at all.
+    pub dirty: bool,
 }
 
 impl FileState {
@@ -344,7 +812,47 @@ impl FileState {
             read_only: false,
             next_creation_order: 0,
             sohm: Vec::new(),
+            loader: None,
+            addrs: Default::default(),
+            appendable: None,
+            dirty: false,
         }
+    }
+
+    /// Force a lazily-opened object into its real form (no-op if already parsed
+    /// or the file is eager). See [`crate::format::reader::force_object`].
+    pub fn force(&mut self, id: ObjId) -> crate::error::Result<()> {
+        if matches!(
+            self.try_get(id).map(|n| &n.kind),
+            Some(ObjectKind::Lazy { .. })
+        ) {
+            crate::format::reader::force_object(self, id)?;
+        }
+        Ok(())
+    }
+
+    /// Like [`resolve`](Self::resolve) but forces lazy objects along the path,
+    /// so navigation of a lazily-opened file parses only what it touches.
+    pub fn resolve_force(&mut self, start: ObjId, path: &str) -> Option<ObjId> {
+        let mut cur = if path.starts_with('/') {
+            self.root
+        } else {
+            start
+        };
+        self.force(cur).ok()?;
+        for comp in path.split('/').filter(|s| !s.is_empty() && *s != ".") {
+            let target = match &self.try_get(cur)?.kind {
+                ObjectKind::Group(g) => g.find(comp)?.target.clone(),
+                _ => return None,
+            };
+            cur = match target {
+                LinkTarget::Hard(id) => id,
+                LinkTarget::Soft(t) => self.resolve_force(self.root, &t)?,
+                LinkTarget::External { .. } => return None,
+            };
+            self.force(cur).ok()?;
+        }
+        Some(cur)
     }
 
     pub fn get(&self, id: ObjId) -> &ObjectNode {
@@ -462,6 +970,17 @@ impl FileState {
         Ok(())
     }
 
+    /// Parse every object a lazily opened file has not reached yet. Forcing a
+    /// group adds its children to the arena, which this then reaches in turn.
+    pub fn force_all(&mut self) -> crate::error::Result<()> {
+        let mut id = 0;
+        while id < self.objects.len() {
+            self.force(id)?;
+            id += 1;
+        }
+        Ok(())
+    }
+
     /// Recompute hard-link reference counts across the arena.
     pub fn recount(&mut self) {
         let n = self.objects.len();
@@ -491,21 +1010,29 @@ pub(crate) struct FileInner {
     pub path: Option<PathBuf>,
     #[allow(dead_code)]
     pub mode: crate::hl::file::OpenMode,
-    pub state: parking_lot::RwLock<FileState>,
+    pub state: crate::lock::RwLock<FileState>,
     /// Synthetic id for this file handle.
     pub id: crate::h5i::hid_t,
     /// Files opened while following external links, keyed by the link's
     /// file-name string (kept open for the lifetime of this file).
-    pub externals: parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<FileInner>>>,
+    pub externals: crate::lock::Mutex<std::collections::HashMap<String, std::sync::Arc<FileInner>>>,
     /// MPI collective-file state (feature `mpi`).
     #[cfg(feature = "mpi")]
-    pub mpi: parking_lot::Mutex<Option<crate::mpi::MpiFile>>,
+    pub mpi: crate::lock::Mutex<Option<crate::mpi::MpiFile>>,
 }
 
 /// The current time in seconds since the Unix epoch (0 on clock error).
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) fn now() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as u32)
         .unwrap_or(0)
+}
+
+/// `wasm32-unknown-unknown` (the browser) has no clock — `SystemTime::now`
+/// panics there — so object times are 0, as on a clock error.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub(crate) fn now() -> u32 {
+    0
 }

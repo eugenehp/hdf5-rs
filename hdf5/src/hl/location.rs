@@ -106,11 +106,11 @@ pub(crate) fn open_external(parent: &Arc<FileInner>, name: &str) -> Result<Arc<F
     let inner = Arc::new(FileInner {
         path: Some(path),
         mode: crate::hl::file::OpenMode::Read,
-        state: parking_lot::RwLock::new(state),
+        state: crate::lock::RwLock::new(state),
         id: crate::handle::next_id(),
-        externals: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        externals: crate::lock::Mutex::new(std::collections::HashMap::new()),
         #[cfg(feature = "mpi")]
-        mpi: parking_lot::Mutex::new(None),
+        mpi: crate::lock::Mutex::new(None),
     });
     parent
         .externals
@@ -137,10 +137,12 @@ pub(crate) fn resolve_path_cross(
         start
     };
     for comp in path.split('/').filter(|s| !s.is_empty() && *s != ".") {
+        // Parse a lazily-stubbed group before reading its links (no-op eagerly).
+        cur_file.state.write().force(cur).ok();
         let target = {
             let state = cur_file.state.read();
             let group = match &state.try_get(cur).ok_or("dangling object")?.kind {
-                ObjectKind::Group(g) => g.clone(),
+                ObjectKind::Group(g) => g,
                 ObjectKind::Unsupported(reason) => {
                     return Err(format!("object is unsupported by this build: {reason}").into())
                 }
@@ -212,6 +214,7 @@ impl Location {
         let file = self.0.file().ok_or("object is not file-resident")?;
         let id = self.0.obj_id().ok_or("object has no location")?;
         let mut state = file.state.write();
+        state.dirty = true;
         if state.read_only {
             return Err("unable to modify: file is read-only".into());
         }
@@ -224,6 +227,7 @@ impl Location {
         let file = self.0.file().ok_or("object is not file-resident")?;
         let id = self.0.obj_id().ok_or("object has no location")?;
         let mut state = file.state.write();
+        state.dirty = true;
         if state.read_only {
             return Err("unable to modify: file is read-only".into());
         }
@@ -235,6 +239,7 @@ impl Location {
     pub fn loc_info(&self) -> Result<LocationInfo> {
         let file = self.0.file().ok_or("object is not file-resident")?;
         let id = self.0.obj_id().ok_or("object has no location")?;
+        file.state.write().force(id).ok();
         let state = file.state.read();
         let node = state.try_get(id).ok_or("dangling object")?;
         let loc_type = match &node.kind {
@@ -244,6 +249,7 @@ impl Location {
             ObjectKind::Unsupported(reason) => {
                 return Err(format!("object is unsupported by this build: {reason}").into())
             }
+            ObjectKind::Lazy { .. } => return Err("object could not be parsed".into()),
         };
         Ok(LocationInfo {
             fileno: file.id as u64,
@@ -278,6 +284,7 @@ impl Location {
     pub fn open_by_token(&self, token: LocationToken) -> Result<Self> {
         let file = self.0.file().ok_or("object is not file-resident")?;
         let id = token.0 as usize;
+        file.state.write().force(id).ok();
         let state = file.state.read();
         let node = state.try_get(id).ok_or("invalid location token")?;
         let payload = match &node.kind {
@@ -296,6 +303,7 @@ impl Location {
             ObjectKind::Unsupported(reason) => {
                 return Err(format!("object is unsupported by this build: {reason}").into())
             }
+            ObjectKind::Lazy { .. } => return Err("object could not be parsed".into()),
         };
         Ok(Self::from_handle(Handle::new(payload)))
     }
@@ -307,6 +315,7 @@ impl Location {
         let start = self.0.obj_id().ok_or("object has no location")?;
         let (file, id) = resolve_path_cross(file, start, path, 0)
             .map_err(|e| crate::error::Error::from(format!("unable to open '{path}': {e}")))?;
+        file.state.write().force(id).ok();
         let state = file.state.read();
         let node = state.try_get(id).ok_or("dangling object")?;
         let payload = match &node.kind {
@@ -322,6 +331,7 @@ impl Location {
                 file: file.clone(),
                 id,
             },
+            ObjectKind::Lazy { .. } => return Err("object could not be parsed".into()),
             ObjectKind::Unsupported(reason) => {
                 return Err(format!("object is unsupported by this build: {reason}").into())
             }
@@ -367,5 +377,138 @@ impl Location {
         let state = file.state.read();
         let node = state.try_get(id).ok_or("dangling object")?;
         Ok(node.attrs.iter().map(|a| a.name.clone()).collect())
+    }
+}
+
+/// An HDF5 **object reference** (`H5R_OBJECT`): the 8-byte address of an object
+/// header, as stored in a reference-typed dataset or attribute.
+///
+/// MATLAB `-v7.3` files use these for cell arrays — the cell dataset holds one
+/// reference per element, each pointing at the real data under `/#refs#`.
+///
+/// The datatype is read as a fixed array of 8 bytes (the reference token), which
+/// is exactly how the format layer decodes datatype class 7, so
+/// `dataset.read_raw::<ObjectReference1>()` needs no conversion.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ObjectReference1 {
+    token: [u8; 8],
+}
+
+impl ObjectReference1 {
+    /// The object-header address this reference points at.
+    pub fn address(&self) -> u64 {
+        u64::from_le_bytes(self.token)
+    }
+
+    /// Build a reference to a given object-header address.
+    pub fn from_address(addr: u64) -> Self {
+        Self {
+            token: addr.to_le_bytes(),
+        }
+    }
+
+    /// True for the null reference, which HDF5 writes as all-zero.
+    pub fn is_null(&self) -> bool {
+        self.token == [0u8; 8]
+    }
+}
+
+impl Debug for ObjectReference1 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "ObjectReference1(0x{:x})", self.address())
+    }
+}
+
+unsafe impl H5Type for ObjectReference1 {
+    fn type_descriptor() -> hdf5_types::TypeDescriptor {
+        use hdf5_types::{IntSize, TypeDescriptor};
+        TypeDescriptor::FixedArray(Box::new(TypeDescriptor::Unsigned(IntSize::U1)), 8)
+    }
+}
+
+/// What an [`ObjectReference1`] resolved to.
+#[derive(Debug)]
+pub enum ReferencedObject {
+    Group(crate::hl::group::Group),
+    Dataset(crate::hl::dataset::Dataset),
+}
+
+impl Location {
+    /// The arena ids of `targets`, which must be objects of this file.
+    fn reference_targets(&self, targets: &[&Location]) -> Result<Vec<crate::model::ObjId>> {
+        let file = self.handle().file().ok_or("not file-resident")?;
+        targets
+            .iter()
+            .map(|t| {
+                let same = t.handle().file().is_some_and(|f| Arc::ptr_eq(f, file));
+                if !same {
+                    return Err("an object reference to another file".into());
+                }
+                t.handle()
+                    .obj_id()
+                    .ok_or_else(|| "a reference to an object without a location".into())
+            })
+            .collect()
+    }
+
+    fn set_attr_refs(&self, name: &str, refs: Vec<crate::model::ObjId>) -> Result<()> {
+        let file = self.handle().file().ok_or("not file-resident")?;
+        let owner = self.handle().obj_id().ok_or("no location")?;
+        let mut state = file.state.write();
+        let node = state.get_mut(owner);
+        let i = node.attr_index(name).ok_or("attribute vanished")?;
+        node.attrs[i].refs = Some(refs);
+        Ok(())
+    }
+
+    /// Creates a scalar attribute holding an object reference (`H5R_OBJECT`)
+    /// to `target`, an object of this file — as NWB's `table` attributes.
+    pub fn new_reference_attr(&self, name: &str, target: &Location) -> Result<Attribute> {
+        let refs = self.reference_targets(&[target])?;
+        let attr = self.new_attr::<ObjectReference1>().create(name)?;
+        self.set_attr_refs(name, refs)?;
+        Ok(attr)
+    }
+
+    /// Creates an attribute holding object references to `targets`, in order.
+    pub fn new_reference_array_attr(&self, name: &str, targets: &[&Location]) -> Result<Attribute> {
+        let refs = self.reference_targets(targets)?;
+        let attr = self
+            .new_attr::<ObjectReference1>()
+            .shape([refs.len()])
+            .create(name)?;
+        self.set_attr_refs(name, refs)?;
+        Ok(attr)
+    }
+
+    /// Resolve an object reference against the file this location belongs to.
+    ///
+    /// The reference token is an object-header address; a lazily-opened file may
+    /// not have walked to that object yet, in which case it is parsed on demand.
+    pub fn dereference(&self, reference: &ObjectReference1) -> Result<ReferencedObject> {
+        if reference.is_null() {
+            return Err("null object reference".into());
+        }
+        let file = self
+            .0
+            .file()
+            .ok_or("cannot dereference against a location with no file")?
+            .clone();
+        let addr = reference.address();
+        let id = {
+            let mut state = file.state.write();
+            crate::format::reader::object_at(&mut state, addr)?
+        };
+        let is_group = file.state.read().is_group(id);
+        Ok(if is_group {
+            ReferencedObject::Group(crate::hl::group::Group::from_handle(Handle::new(
+                Payload::Group { file, id },
+            )))
+        } else {
+            ReferencedObject::Dataset(crate::hl::dataset::Dataset::from_handle(Handle::new(
+                Payload::Dataset { file, id },
+            )))
+        })
     }
 }

@@ -43,13 +43,14 @@ f16 = ["hdf5-no-c-types/f16", "dep:half"]
 # external
 bitflags = "2.4"
 cfg-if = { workspace = true }
-libc = { workspace = true }
 ndarray = "0.15"
 parking_lot = "0.12"
-flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
+# the name index of large groups
+bbtree = "0.1.7"
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
 snap = "1.1"
-ruzstd = "0.7"
+zstd-rs = "=0.1.0"  # blosc zstd: pure Rust, forbid(unsafe_code), capped decode
 memmap2 = "0.9"
 rlx = { version = "0.2.10", features = ["tensor"], optional = true }
 # renamed: its lib target is `mpi`, which would shadow our `hdf5::mpi` module
@@ -64,6 +65,11 @@ half = { workspace = true }
 num-complex = { workspace = true }
 pretty_assertions = "1.4"
 tempfile = "3.9"
+
+# `wasm32-unknown-unknown` tests run under Node via wasm-bindgen-test-runner
+# (see tests/wasm.rs)
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [[example]]
 name = "simple"

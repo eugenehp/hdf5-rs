@@ -140,7 +140,9 @@ impl Comm {
         Self {
             rank: world.rank() as usize,
             size: world.size() as usize,
-            links: Arc::new(Links::MpiRs { _universe: universe }),
+            links: Arc::new(Links::MpiRs {
+                _universe: universe,
+            }),
         }
     }
 
@@ -263,7 +265,9 @@ impl Comm {
             Links::Root(streams) => send_frame(&mut streams[rank].lock().unwrap(), data),
             Links::Leaf(_) => Err("root_send called on a non-root rank".into()),
             #[cfg(feature = "mpi-rs")]
-            Links::MpiRs { .. } if self.rank != 0 => Err("root_send called on a non-root rank".into()),
+            Links::MpiRs { .. } if self.rank != 0 => {
+                Err("root_send called on a non-root rank".into())
+            }
             #[cfg(feature = "mpi-rs")]
             Links::MpiRs { .. } => {
                 mpirs_send(rank, data);
@@ -277,7 +281,9 @@ impl Comm {
             Links::Root(streams) => recv_frame(&mut streams[rank].lock().unwrap()),
             Links::Leaf(_) => Err("root_recv called on a non-root rank".into()),
             #[cfg(feature = "mpi-rs")]
-            Links::MpiRs { .. } if self.rank != 0 => Err("root_recv called on a non-root rank".into()),
+            Links::MpiRs { .. } if self.rank != 0 => {
+                Err("root_recv called on a non-root rank".into())
+            }
             #[cfg(feature = "mpi-rs")]
             Links::MpiRs { .. } => Ok(mpirs_recv(rank)),
         }
@@ -622,7 +628,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mpi_rs_singleton.h5");
         let f = super::create(&path, &comm).unwrap();
-        let ds = f.new_dataset::<i32>().shape([comm.size(), 3]).create("x").unwrap();
+        let ds = f
+            .new_dataset::<i32>()
+            .shape([comm.size(), 3])
+            .create("x")
+            .unwrap();
         ds.write_slice(&ndarray::arr1(&[1i32, 2, 3]), ndarray::s![0..1, ..])
             .unwrap();
         f.close().unwrap();

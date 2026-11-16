@@ -78,11 +78,21 @@ impl Deref for Container {
 impl Container {
     /// Load a snapshot of this container's metadata and raw data.
     pub(crate) fn snapshot(&self) -> Result<ContainerData> {
+        self.load(true)
+    }
+
+    /// A snapshot of the metadata alone: `data` and `vlen` are left empty, so
+    /// asking what a dataset is does not read, or copy, what it holds.
+    fn metadata(&self) -> Result<ContainerData> {
+        self.load(false)
+    }
+
+    fn load(&self, with_data: bool) -> Result<ContainerData> {
         let file = self.0.file().ok_or("container is not file-resident")?;
         match self.0.payload() {
             Payload::Dataset { id, .. } => {
                 // materialize lazily-referenced data on first access
-                {
+                if with_data {
                     let state = file.state.read();
                     let needs = state
                         .dataset_data(*id)
@@ -103,8 +113,16 @@ impl Container {
                     dims: d.dims.clone(),
                     is_scalar: d.is_scalar,
                     is_null: d.is_null,
-                    data: d.data.clone(),
-                    vlen: d.vlen.clone(),
+                    data: if with_data {
+                        d.data.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    vlen: if with_data {
+                        d.vlen.clone()
+                    } else {
+                        VlenStore::default()
+                    },
                 })
             }
             Payload::Attribute { owner, name, .. } => {
@@ -129,6 +147,7 @@ impl Container {
     pub(crate) fn store(&self, data: Vec<u8>, vlen: VlenStore) -> Result<()> {
         let file: &Arc<FileInner> = self.0.file().ok_or("container is not file-resident")?;
         let mut state = file.state.write();
+        state.dirty = true;
         if state.read_only {
             return Err("unable to write: file is read-only".into());
         }
@@ -154,13 +173,13 @@ impl Container {
 
     /// Returns the datatype of this container.
     pub fn dtype(&self) -> Result<Datatype> {
-        let snap = self.snapshot()?;
+        let snap = self.metadata()?;
         Datatype::from_descriptor(&snap.dtype)
     }
 
     /// Returns the dataspace of this container.
     pub fn space(&self) -> Result<Dataspace> {
-        let snap = self.snapshot()?;
+        let snap = self.metadata()?;
         let extents = if snap.is_null {
             crate::hl::extents::Extents::Null
         } else if snap.is_scalar {
@@ -189,24 +208,24 @@ impl Container {
 
     /// Returns the shape of the container's dataspace.
     pub fn shape(&self) -> Vec<Ix> {
-        self.snapshot()
+        self.metadata()
             .map(|s| s.dims.iter().map(|&d| d as usize).collect())
             .unwrap_or_default()
     }
 
     /// Returns the number of dimensions.
     pub fn ndim(&self) -> usize {
-        self.snapshot().map(|s| s.dims.len()).unwrap_or(0)
+        self.metadata().map(|s| s.dims.len()).unwrap_or(0)
     }
 
     /// Returns the total number of elements.
     pub fn size(&self) -> usize {
-        self.snapshot().map(|s| s.num_elements()).unwrap_or(0)
+        self.metadata().map(|s| s.num_elements()).unwrap_or(0)
     }
 
     /// Returns whether the dataspace is scalar.
     pub fn is_scalar(&self) -> bool {
-        self.snapshot().map(|s| s.is_scalar).unwrap_or(false)
+        self.metadata().map(|s| s.is_scalar).unwrap_or(false)
     }
 
     /// Returns the amount of storage used by the data, in bytes.
@@ -219,15 +238,75 @@ impl Container {
                     .lazy
                     .as_ref()
                     .map(|l| match &l.kind {
-                        crate::model::LazyKind::Contiguous { len, .. } => *len as u64,
-                        crate::model::LazyKind::Chunked { chunks, .. } => {
-                            chunks.iter().map(|(_, size, _, _)| u64::from(*size)).sum()
-                        }
+                        crate::model::LazyKind::Contiguous { len, .. } => *len,
+                        // Resolve the chunk index on demand (deferred from open);
+                        // storage_size is an explicit query, not a hot path.
+                        crate::model::LazyKind::Chunked {
+                            index,
+                            dims,
+                            chunk_dims,
+                            elem_size,
+                            ..
+                        } => crate::format::reader::resolve_chunks(
+                            &*l.src, l.base, index, dims, chunk_dims, *elem_size,
+                        )
+                        .map(|chunks| chunks.iter().map(|(_, size, _, _)| u64::from(*size)).sum())
+                        .unwrap_or(0),
                     })
                     .unwrap_or(d.data.len() as u64);
             }
         }
         self.snapshot().map(|s| s.data.len() as u64).unwrap_or(0)
+    }
+
+    /// Rows `[r0, r1)` of the leading axis as raw elements, for random access
+    /// into large datasets (e.g. one epoch of an `(N, C, T)` array).
+    ///
+    /// Unlike `read_slice`, this never clones the whole dataset: lazily stored
+    /// data decodes only the chunks overlapping the rows (the chunk index is
+    /// walked once and memoized); materialized data is sliced in place. `T`
+    /// must be the exact on-disk element type (no conversion), non-vlen.
+    pub fn read_rows_raw<T: H5Type>(&self, r0: usize, r1: usize) -> Result<Vec<T>> {
+        let file = self.0.file().ok_or("container is not file-resident")?;
+        let Payload::Dataset { id, .. } = self.0.payload() else {
+            return Err("read_rows_raw: not a dataset".into());
+        };
+        let state = file.state.read();
+        let d = state.dataset_data(*id).ok_or("not a dataset")?;
+        if T::type_descriptor() != d.dtype || convert::has_vlen(&d.dtype) {
+            return Err(format!(
+                "read_rows_raw: element type {:?} must equal the on-disk type {:?}",
+                T::type_descriptor(),
+                d.dtype
+            )
+            .into());
+        }
+        if d.dims.is_empty() || r0 > r1 || r1 as u64 > d.dims[0] {
+            return Err(format!(
+                "read_rows_raw: rows {r0}..{r1} out of range for dims {:?}",
+                d.dims
+            )
+            .into());
+        }
+        let elem = disk_size(&d.dtype);
+        if elem != mem::size_of::<T>() {
+            return Err("read_rows_raw: element size mismatch".into());
+        }
+        let row_bytes = elem * d.dims[1..].iter().map(|&x| x as usize).product::<usize>();
+        let bytes = match &d.lazy {
+            Some(l) => l.materialize_rows(r0 as u64, r1 as u64, row_bytes)?,
+            None => d.data[r0 * row_bytes..r1 * row_bytes].to_vec(),
+        };
+        let n = bytes.len() / elem;
+        let mut out: Vec<T> = Vec::with_capacity(n);
+        // SAFETY: T is a plain H5 scalar of exactly `elem` bytes (checked above)
+        // and the bytes are in native (little-endian) order: lazy data swaps as
+        // it materializes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, n * elem);
+            out.set_len(n);
+        }
+        Ok(out)
     }
 
     /// Creates a reader wrapper for this container.
@@ -398,9 +477,40 @@ fn bytes_into_vec<T: H5Type>(bytes: Vec<u8>, n: usize) -> Result<Vec<T>> {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr().cast::<u8>(), bytes.len());
         out.set_len(n);
     }
-    // ownership of any vlen pointers has moved into `out`
-    mem::forget(bytes);
+    // any vlen pointers in `bytes` now belong to `out`; dropping a Vec<u8>
+    // frees the buffer alone, and never follows them
     Ok(out)
+}
+
+/// `n` zeroed elements, from the allocator's zero pages. Only for types all
+/// zero bytes are valid for: plain numbers.
+fn zeroed_vec<T>(n: usize) -> Result<Vec<T>> {
+    if n == 0 || mem::size_of::<T>() == 0 {
+        return Ok(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<T>(n).map_err(|_| "allocation too large")?;
+    // SAFETY: the layout is non-zero sized, and the Vec takes the block with the
+    // same layout, its `n` elements initialized by the zeroing
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout).cast::<T>();
+        if p.is_null() {
+            // a dataset bigger than memory is an error to read whole
+            return Err(format!(
+                "not enough memory to read {} bytes at once; read it in parts",
+                layout.size()
+            )
+            .into());
+        }
+        Ok(Vec::from_raw_parts(p, n, n))
+    }
+}
+
+/// Is this a plain number, the same in memory as in the model?
+fn is_plain_number(desc: &TypeDescriptor) -> bool {
+    matches!(
+        desc,
+        TypeDescriptor::Integer(_) | TypeDescriptor::Unsigned(_) | TypeDescriptor::Float(_)
+    )
 }
 
 /// View a `&[T]` as raw bytes.
@@ -450,6 +560,18 @@ impl<'a> Reader<'a> {
     }
 
     fn read_elements<T: H5Type>(&self, selection: Option<Selection>) -> Result<(Vec<T>, Vec<Ix>)> {
+        match &selection {
+            None => {
+                if let Some(read) = self.read_numbers::<T>()? {
+                    return Ok(read);
+                }
+            }
+            Some(sel) => {
+                if let Some(read) = self.read_picked::<T>(sel)? {
+                    return Ok(read);
+                }
+            }
+        }
         let snap = self.obj.snapshot()?;
         let dst_desc = T::type_descriptor();
         check_conversion(self.conv, &snap.dtype, &dst_desc)?;
@@ -488,6 +610,134 @@ impl<'a> Reader<'a> {
                 Ok((bytes_into_vec(mem, indices.len())?, out_shape))
             }
         }
+    }
+
+    /// A selection out of a lazily stored dataset: only the stored runs or
+    /// chunks holding selected elements are read and decoded (through the
+    /// dataset's chunk cache) — never the whole dataset. `None` when the data
+    /// is already in memory or holds variable-length values.
+    fn read_picked<T: H5Type>(&self, sel: &Selection) -> Result<Option<(Vec<T>, Vec<Ix>)>> {
+        let Payload::Dataset { id, .. } = self.obj.0.payload() else {
+            return Ok(None);
+        };
+        let file = self.obj.0.file().ok_or("container is not file-resident")?;
+        let lazy = {
+            let state = file.state.read();
+            state.dataset_data(*id).ok_or("not a dataset")?.lazy.clone()
+        };
+        let Some(lazy) = lazy else {
+            return Ok(None);
+        };
+        let meta = self.obj.metadata()?;
+        if convert::has_vlen(&meta.dtype) {
+            return Ok(None);
+        }
+        let dst = T::type_descriptor();
+        check_conversion(self.conv, &meta.dtype, &dst)?;
+        let shape: Vec<Ix> = meta.dims.iter().map(|&d| d as usize).collect();
+        let out_shape = sel.out_shape(&shape)?;
+        let pick = sel.clone().into_raw(&shape)?.pick(&shape)?;
+        let n = pick.len();
+        let esize = disk_size(&meta.dtype);
+        let bytes = lazy.pick(&meta.dims, esize, &pick)?;
+        let mut out = zeroed_vec::<T>(n)?;
+        let numbers = is_plain_number(&meta.dtype) && is_plain_number(&dst);
+        if numbers {
+            // SAFETY: `out` holds `n` plain numbers, valid whatever their bytes
+            let into = unsafe {
+                std::slice::from_raw_parts_mut(
+                    out.as_mut_ptr().cast::<u8>(),
+                    n * mem::size_of::<T>(),
+                )
+            };
+            if convert::convert_numbers(&meta.dtype, &dst, &bytes, into) {
+                return Ok(Some((out, out_shape)));
+            }
+        }
+        drop(out);
+        let mem = convert::model_to_mem(&meta.dtype, &dst, &bytes, &meta.vlen, n)?;
+        Ok(Some((bytes_into_vec(mem, n)?, out_shape)))
+    }
+
+    /// A whole dataset of plain numbers: straight into the result when it is
+    /// the type asked for, else through one conversion, with no copy kept in
+    /// the file. `None` for anything else.
+    fn read_numbers<T: H5Type>(&self) -> Result<Option<(Vec<T>, Vec<Ix>)>> {
+        let Payload::Dataset { id, .. } = self.obj.0.payload() else {
+            return Ok(None);
+        };
+        let file = self.obj.0.file().ok_or("container is not file-resident")?;
+        let meta = self.obj.metadata()?;
+        let dst = T::type_descriptor();
+        if !is_plain_number(&meta.dtype) || !is_plain_number(&dst) {
+            return Ok(None);
+        }
+        check_conversion(self.conv, &meta.dtype, &dst)?;
+        let n = meta.num_elements();
+        let shape: Vec<Ix> = meta.dims.iter().map(|&d| d as usize).collect();
+        let lazy = {
+            let state = file.state.read();
+            state.dataset_data(*id).ok_or("not a dataset")?.lazy.clone()
+        };
+        if meta.dtype == dst {
+            let mut out = zeroed_vec::<T>(n)?;
+            // SAFETY: `out` holds `n` plain numbers, valid whatever their bytes
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    out.as_mut_ptr().cast::<u8>(),
+                    n * mem::size_of::<T>(),
+                )
+            };
+            match &lazy {
+                Some(l) => l.materialize_into(bytes)?,
+                None => {
+                    let state = file.state.read();
+                    let d = state.dataset_data(*id).ok_or("not a dataset")?;
+                    if d.data.len() < bytes.len() {
+                        return Err("source data too short".into());
+                    }
+                    bytes.copy_from_slice(&d.data[..bytes.len()]);
+                }
+            }
+            return Ok(Some((out, shape)));
+        }
+        // converted straight into the result, no intermediate buffer
+        let mut out = zeroed_vec::<T>(n)?;
+        // SAFETY: `out` holds `n` plain numbers, valid whatever their bytes
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), n * mem::size_of::<T>())
+        };
+        let ssize = disk_size(&meta.dtype);
+        let into = |data: &[u8], bytes: &mut [u8]| -> Result<()> {
+            let data = data.get(..n * ssize).ok_or("source data too short")?;
+            if !convert::convert_numbers(&meta.dtype, &dst, data, bytes) {
+                bytes.copy_from_slice(&convert::model_to_mem(
+                    &meta.dtype,
+                    &dst,
+                    data,
+                    &meta.vlen,
+                    n,
+                )?);
+            }
+            Ok(())
+        };
+        let fused = |l: &crate::model::LazyData, bytes: &mut [u8]| {
+            let conv = |s: &[u8], d: &mut [u8]| {
+                convert::convert_numbers(&meta.dtype, &dst, s, d);
+            };
+            l.materialize_converted(bytes, ssize, mem::size_of::<T>(), &conv)
+        };
+        match &lazy {
+            // decoded, swapped and converted in one pass where it can be
+            Some(l) if convert::numbers_convertible(&meta.dtype, &dst) && fused(l, bytes)? => {}
+            Some(l) => into(&l.materialize_bytes()?, bytes)?,
+            None => {
+                let state = file.state.read();
+                let d = state.dataset_data(*id).ok_or("not a dataset")?;
+                into(&d.data, bytes)?;
+            }
+        }
+        Ok(Some((out, shape)))
     }
 
     pub fn read_raw<T: H5Type>(&self) -> Result<Vec<T>> {
@@ -625,6 +875,9 @@ impl<'a> Writer<'a> {
     }
 
     fn write_elements<T: H5Type>(&self, data: &[T], selection: Option<Selection>) -> Result<()> {
+        if self.write_through(data, selection.as_ref())? {
+            return Ok(());
+        }
         let snap = self.obj.snapshot()?;
         let src_desc = T::type_descriptor();
         check_conversion(self.conv, &src_desc, &snap.dtype)?;
@@ -684,6 +937,72 @@ impl<'a> Writer<'a> {
                 self.obj.store(model_data, store)
             }
         }
+    }
+
+    /// A write into a chunked dataset whose chunks are in the file being
+    /// written: only the chunks it touches are read, updated and appended to
+    /// the file — the dataset is never loaded whole. `false` for any other
+    /// dataset (the write then goes to the in-memory copy).
+    fn write_through<T: H5Type>(&self, data: &[T], selection: Option<&Selection>) -> Result<bool> {
+        let Payload::Dataset { id, .. } = self.obj.0.payload() else {
+            return Ok(false);
+        };
+        let file = self.obj.0.file().ok_or("container is not file-resident")?;
+        #[cfg(feature = "mpi")]
+        if file.mpi.lock().is_some() {
+            return Ok(false); // collective files log writes for the merge
+        }
+        let mut state = file.state.write();
+        let Some(disk) = state.appendable.clone() else {
+            return Ok(false);
+        };
+        let d = state.dataset_data(*id).ok_or("not a dataset")?;
+        let Some(lazy) = d.lazy.clone() else {
+            return Ok(false);
+        };
+        let ours = Arc::as_ptr(&disk) as *const ();
+        if lazy.swap != 0
+            || Arc::as_ptr(&lazy.src) as *const () != ours
+            || !matches!(lazy.kind, crate::model::LazyKind::Chunked { .. })
+            || convert::has_vlen(&d.dtype)
+            || d.dims.is_empty()
+        {
+            return Ok(false);
+        }
+        let (dtype, dims) = (d.dtype.clone(), d.dims.clone());
+        let fill = match &d.fill {
+            crate::model::FillValue::UserDefined(v) => v.clone(),
+            _ => Vec::new(),
+        };
+        state.dirty = true;
+        if state.read_only {
+            return Err("unable to write: file is read-only".into());
+        }
+        let src_desc = T::type_descriptor();
+        check_conversion(self.conv, &src_desc, &dtype)?;
+        let shape: Vec<Ix> = dims.iter().map(|&d| d as usize).collect();
+        let pick = match selection {
+            None => crate::hl::selection::RawSelection::All.pick(&shape)?,
+            Some(sel) => sel.clone().into_raw(&shape)?.pick(&shape)?,
+        };
+        if data.len() != pick.len() {
+            return Err(format!(
+                "write: expected {} elements, got {}",
+                pick.len(),
+                data.len()
+            )
+            .into());
+        }
+        let mut store = VlenStore::new();
+        let values = convert::mem_to_model(
+            &src_desc,
+            &dtype,
+            slice_as_bytes(data),
+            &mut store,
+            data.len(),
+        )?;
+        lazy.write_pick(&disk, &pick, &values, &fill)?;
+        Ok(true)
     }
 
     pub fn write<'b, A, T, D>(&self, arr: A) -> Result<()>

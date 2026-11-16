@@ -54,6 +54,14 @@ struct Ref {
 struct Writer<'a> {
     state: &'a FileState,
     buf: Buf,
+    /// File address of `buf[0]`: 0 for a whole image, the old end of file
+    /// for an incremental flush (see [`serialize_append`]).
+    origin: u64,
+    /// Whether lazily held data is already in the file being written, and
+    /// can be referenced where it is instead of copied.
+    in_file: Option<&'a dyn Fn(&crate::model::LazyData) -> bool>,
+    /// Where each plain dataset's data went, for [`serialize_append`].
+    placed: Vec<(ObjId, Placed)>,
     memo: HashMap<ObjId, Ref>,
     visiting: Vec<ObjId>,
     /// Shared-message stores, one per configured SOHM index.
@@ -92,6 +100,9 @@ pub fn serialize(state: &FileState) -> Result<Vec<u8>> {
     let mut w = Writer {
         state,
         buf: Buf::new(),
+        origin: 0,
+        in_file: None,
+        placed: Vec::new(),
         memo: HashMap::new(),
         visiting: Vec::new(),
         sohm,
@@ -122,11 +133,96 @@ pub fn serialize(state: &FileState) -> Result<Vec<u8>> {
     Ok(w.buf.bytes)
 }
 
+/// One chunk as the index records it: offsets (rank + 1, the last 0),
+/// stored size, filter mask, address.
+pub(crate) struct ChunkRec {
+    offsets: Vec<u64>,
+    size: u32,
+    filter_mask: u32,
+    addr: u64,
+}
+
+/// A version-3 chunked layout message.
+fn chunked_layout(btree: u64, chunk_dims: &[u64], elem_size: usize) -> Vec<u8> {
+    let mut m = Buf::new();
+    m.u8(3); // layout version 3
+    m.u8(2); // chunked
+    m.u8((chunk_dims.len() + 1) as u8); // dimensionality (incl. element-size dim)
+    m.u64(btree);
+    for &c in chunk_dims {
+        m.u32(c as u32);
+    }
+    m.u32(elem_size as u32); // element size (last "dimension")
+    m.bytes
+}
+
+/// Where a dataset's data was written.
+pub(crate) enum Placed {
+    Contiguous {
+        addr: u64,
+        len: u64,
+    },
+    Chunked {
+        btree: u64,
+        entries: Vec<super::reader::ChunkEntry>,
+        filters: Vec<filt::RawFilter>,
+        chunk_dims: Vec<u64>,
+        elem_size: usize,
+    },
+}
+
+/// What an incremental flush writes: `tail` goes at the old end of file
+/// (`origin`), `superblock` over the old one.
+pub(crate) struct Appended {
+    pub tail: Vec<u8>,
+    pub superblock: Vec<u8>,
+    pub placed: Vec<(ObjId, Placed)>,
+}
+
+/// Serialize for an incremental flush: everything new is laid out from
+/// `origin` (the current end of file, 8-aligned, relative to the base
+/// address) on, and data `in_file` says is already in the file is pointed at
+/// where it is rather than written again. The old metadata stays in the file,
+/// unreferenced. `None` for what this cannot do in place (shared-message
+/// tables need the whole-file writer).
+pub(crate) fn serialize_append(
+    state: &FileState,
+    origin: u64,
+    in_file: &dyn Fn(&crate::model::LazyData) -> bool,
+) -> Result<Option<Appended>> {
+    if !state.sohm.is_empty() || origin % 8 != 0 {
+        return Ok(None);
+    }
+    let mut w = Writer {
+        state,
+        buf: Buf::new(),
+        origin,
+        in_file: Some(in_file),
+        placed: Vec::new(),
+        memo: HashMap::new(),
+        visiting: Vec::new(),
+        sohm: Vec::new(),
+        sohm_patches: Vec::new(),
+    };
+    let root = w.write_object(state.root)?;
+    w.buf.pad8();
+    let eof = origin + w.buf.len() as u64;
+    let ub = state.userblock;
+    w.buf.bytes.splice(0..0, std::iter::repeat_n(0u8, 96));
+    w.write_superblock(root.oh_addr, root.btree, root.heap, ub + eof, ub);
+    let superblock = w.buf.bytes.drain(..96).collect();
+    Ok(Some(Appended {
+        tail: w.buf.bytes,
+        superblock,
+        placed: w.placed,
+    }))
+}
+
 impl<'a> Writer<'a> {
     /// Append `bytes` at the next 8-aligned offset, returning its address.
     fn append(&mut self, bytes: &[u8]) -> u64 {
         self.buf.pad8();
-        let addr = self.buf.len() as u64;
+        let addr = self.origin + self.buf.len() as u64;
         self.buf.raw(bytes);
         addr
     }
@@ -160,6 +256,24 @@ impl<'a> Writer<'a> {
         self.buf.bytes[..96].copy_from_slice(&b.bytes);
     }
 
+    /// Object references' bytes: each target written first (so its object
+    /// header has an address), then its address. A reference to an object
+    /// being written (one enclosing the reference) cannot be placed.
+    fn resolve_refs(&mut self, targets: &[ObjId]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(8 * targets.len());
+        for &t in targets {
+            if self.visiting.contains(&t) {
+                return Err(
+                    "an object reference to an object enclosing it is not supported by the writer"
+                        .into(),
+                );
+            }
+            let r = self.write_object(t)?;
+            out.extend_from_slice(&r.oh_addr.to_le_bytes());
+        }
+        Ok(out)
+    }
+
     fn write_object(&mut self, id: ObjId) -> Result<Ref> {
         if let Some(r) = self.memo.get(&id) {
             return Ok(*r);
@@ -171,6 +285,9 @@ impl<'a> Writer<'a> {
         let node = self.state.get(id);
         let r = match &node.kind {
             ObjectKind::Group(_) => self.write_group(id)?,
+            ObjectKind::Lazy { .. } => {
+                return Err("cannot serialize a lazily-parsed object (read-only)".into())
+            }
             ObjectKind::Dataset(d) => {
                 let d = d.clone();
                 self.write_dataset(id, &d)?
@@ -486,7 +603,7 @@ impl<'a> Writer<'a> {
     /// Patch left/right sibling pointers of a freshly written node level.
     fn patch_siblings(&mut self, nodes: &[(u64, u64, u64)]) {
         for i in 0..nodes.len() {
-            let addr = nodes[i].1 as usize;
+            let addr = (nodes[i].1 - self.origin) as usize;
             if i > 0 {
                 self.buf.patch_u64(addr + 8, nodes[i - 1].1);
             }
@@ -547,14 +664,44 @@ impl<'a> Writer<'a> {
     }
 
     fn write_dataset(&mut self, id: ObjId, d: &DatasetData) -> Result<Ref> {
-        if d.lazy.is_some() {
-            return Err("internal: lazy dataset not materialized before serialization".into());
-        }
+        // object references: the targets' addresses for the data
+        let resolved;
+        let d = match &d.refs {
+            Some(refs) => {
+                let mut r = d.clone();
+                r.data = self.resolve_refs(refs)?;
+                resolved = r;
+                &resolved
+            }
+            None => d,
+        };
         let elem_size = disk_size(&d.dtype);
         let n_elems = d.num_elements();
+        // Data held lazily is pointed at where it is, when that is in the file
+        // being written (and stored as it is declared: little-endian, whole);
+        // otherwise read now, one dataset at a time.
+        let in_place = d.lazy.as_ref().filter(|l| {
+            l.swap == 0
+                && self.in_file.is_some_and(|f| f(l))
+                && match &l.kind {
+                    crate::model::LazyKind::Contiguous { len, .. } => {
+                        *len >= (n_elems * elem_size) as u64
+                    }
+                    crate::model::LazyKind::Chunked { .. } => {
+                        matches!(d.layout, LayoutClass::Chunked(_))
+                    }
+                }
+        });
+        if let Some(l) = in_place {
+            let (layout_msg, raw_filters) = self.layout_in_place(id, d, l, n_elems * elem_size)?;
+            return self.finish_dataset(id, d, raw_filters, layout_msg);
+        }
 
         // Resolve vlen store into a real global-heap collection first.
-        let mut data = d.data.clone();
+        let mut data = match &d.lazy {
+            Some(l) => l.materialize_bytes()?,
+            None => d.data.clone(),
+        };
         if has_vlen(&d.dtype) && !d.vlen.is_empty() {
             let gcol = self.write_gheap(&d.vlen);
             self.fixup_vlen(&d.dtype.clone(), &mut data, n_elems, gcol);
@@ -585,6 +732,15 @@ impl<'a> Writer<'a> {
                 } else {
                     (self.append(&data), data.len() as u64)
                 };
+                if data_addr != UNDEF && !has_vlen(&d.dtype) {
+                    self.placed.push((
+                        id,
+                        Placed::Contiguous {
+                            addr: data_addr,
+                            len: size,
+                        },
+                    ));
+                }
                 let mut m = Buf::new();
                 m.u8(3); // layout version 3
                 m.u8(1); // contiguous
@@ -593,28 +749,122 @@ impl<'a> Writer<'a> {
                 m.bytes
             }
             LayoutClass::Chunked(chunk_dims) => {
-                let btree = self.write_chunks(d, &data, chunk_dims, &raw_filters, elem_size)?;
-                let rank = d.dims.len();
-                let mut m = Buf::new();
-                m.u8(3); // layout version 3
-                m.u8(2); // chunked
-                m.u8((rank + 1) as u8); // dimensionality (incl. element-size dim)
-                m.u64(btree);
-                for &c in chunk_dims {
-                    m.u32(c as u32);
+                let recs = self.write_chunks(d, &data, chunk_dims, &raw_filters, elem_size)?;
+                let btree = self.write_chunk_index(&recs, d.dims.len(), chunk_dims, elem_size)?;
+                if !has_vlen(&d.dtype) {
+                    self.placed.push((
+                        id,
+                        Placed::Chunked {
+                            btree,
+                            entries: recs
+                                .into_iter()
+                                .map(|r| (r.offsets, r.size, r.filter_mask, r.addr))
+                                .collect(),
+                            filters: raw_filters.clone(),
+                            chunk_dims: chunk_dims.clone(),
+                            elem_size,
+                        },
+                    ));
                 }
-                m.u32(elem_size as u32); // element size (last "dimension")
-                m.bytes
+                chunked_layout(btree, chunk_dims, elem_size)
             }
         };
+        self.finish_dataset(id, d, raw_filters, layout_msg)
+    }
 
+    /// The layout message (and filter pipeline) of a dataset whose data is
+    /// already in the file: contiguous data is pointed at; chunks keep their
+    /// addresses, under a fresh index that also holds chunks written since.
+    fn layout_in_place(
+        &mut self,
+        id: ObjId,
+        d: &DatasetData,
+        l: &crate::model::LazyData,
+        bytes: usize,
+    ) -> Result<(Vec<u8>, Vec<filt::RawFilter>)> {
+        match &l.kind {
+            crate::model::LazyKind::Contiguous { offset, .. } => {
+                let addr = offset - l.base;
+                let mut m = Buf::new();
+                m.u8(3);
+                m.u8(1);
+                m.u64(addr);
+                m.u64(bytes as u64);
+                self.placed.push((
+                    id,
+                    Placed::Contiguous {
+                        addr,
+                        len: bytes as u64,
+                    },
+                ));
+                Ok((m.bytes, Vec::new()))
+            }
+            crate::model::LazyKind::Chunked {
+                chunk_dims,
+                elem_size,
+                filters,
+                ..
+            } => {
+                let rank = d.dims.len();
+                // chunks wholly past the extent (after shrinking) are dropped
+                let mut recs: Vec<ChunkRec> = l
+                    .chunk_list()?
+                    .iter()
+                    .filter(|(offs, ..)| (0..rank).all(|i| offs[i] < d.dims[i]))
+                    .map(|(offs, size, mask, addr)| {
+                        let mut offsets = offs[..rank].to_vec();
+                        offsets.push(0);
+                        ChunkRec {
+                            offsets,
+                            size: *size,
+                            filter_mask: *mask,
+                            addr: *addr,
+                        }
+                    })
+                    .collect();
+                recs.sort_by(|a, b| a.offsets.cmp(&b.offsets));
+                let btree = self.write_chunk_index(&recs, rank, chunk_dims, *elem_size)?;
+                self.placed.push((
+                    id,
+                    Placed::Chunked {
+                        btree,
+                        entries: recs
+                            .into_iter()
+                            .map(|r| (r.offsets, r.size, r.filter_mask, r.addr))
+                            .collect(),
+                        filters: filters.clone(),
+                        chunk_dims: chunk_dims.clone(),
+                        elem_size: *elem_size,
+                    },
+                ));
+                Ok((
+                    chunked_layout(btree, chunk_dims, *elem_size),
+                    filters.clone(),
+                ))
+            }
+        }
+    }
+
+    /// The dataset's object header, around its layout message.
+    fn finish_dataset(
+        &mut self,
+        id: ObjId,
+        d: &DatasetData,
+        raw_filters: Vec<filt::RawFilter>,
+        layout_msg: Vec<u8>,
+    ) -> Result<Ref> {
         let mut msgs = Vec::new();
         let (f1, b1) = self.maybe_share(
             MSG_DATASPACE,
             encode_dataspace(&d.dims, &d.maxdims, d.is_scalar, d.is_null),
         );
         msgs.push((MSG_DATASPACE, f1, b1));
-        let (f2, b2) = self.maybe_share(MSG_DATATYPE, datatype::encode(&d.dtype));
+        let dtype = if d.refs.is_some() {
+            datatype::encode_object_reference()
+        } else {
+            datatype::encode(&d.dtype)
+        };
+        let (f2, b2) = self.maybe_share(MSG_DATATYPE, dtype);
         msgs.push((MSG_DATATYPE, f2, b2));
         let (f3, b3) = self.maybe_share(MSG_FILL, encode_fill(&d.fill));
         msgs.push((MSG_FILL, f3, b3));
@@ -641,7 +891,7 @@ impl<'a> Writer<'a> {
         chunk_dims: &[u64],
         raw_filters: &[filt::RawFilter],
         elem_size: usize,
-    ) -> Result<u64> {
+    ) -> Result<Vec<ChunkRec>> {
         let rank = d.dims.len();
         let chunk_elems: usize = chunk_dims.iter().map(|&c| c as usize).product();
         let chunk_bytes = chunk_elems * elem_size;
@@ -655,40 +905,18 @@ impl<'a> Writer<'a> {
             .collect();
         let total_chunks: usize = nchunks.iter().product();
 
-        struct ChunkEntry {
-            offsets: Vec<u64>, // rank+1 coords (last = 0)
-            size: u32,
-            filter_mask: u32,
-            addr: u64,
-        }
-        let mut chunk_entries: Vec<ChunkEntry> = Vec::new();
+        let mut chunk_entries: Vec<ChunkRec> = Vec::new();
 
+        // every chunk's origin, row-major
+        let mut bases = Vec::with_capacity(total_chunks.min(1 << 16));
         let mut idx = vec![0usize; rank];
         for _ in 0..total_chunks {
-            let base: Vec<u64> = idx
-                .iter()
-                .zip(chunk_dims)
-                .map(|(&i, &c)| i as u64 * c)
-                .collect();
-            let mut chunk = vec![0u8; chunk_bytes];
-            gather_chunk(data, &d.dims, chunk_dims, &base, elem_size, &mut chunk);
-
-            let filtered = if raw_filters.is_empty() {
-                chunk
-            } else {
-                filt::apply(raw_filters, elem_size, &chunk)?
-            };
-            let size = filtered.len() as u32;
-            let addr = self.append(&filtered);
-            let mut offsets = base.clone();
-            offsets.push(0);
-            chunk_entries.push(ChunkEntry {
-                offsets,
-                size,
-                filter_mask: 0,
-                addr,
-            });
-
+            bases.push(
+                idx.iter()
+                    .zip(chunk_dims)
+                    .map(|(&i, &c)| i as u64 * c)
+                    .collect::<Vec<u64>>(),
+            );
             // advance N-D chunk index (row-major)
             let mut k = rank;
             while k > 0 {
@@ -701,6 +929,44 @@ impl<'a> Writer<'a> {
             }
         }
 
+        // gathered and filtered on every core, a batch at a time (bounding
+        // what is held), then appended in order
+        let encode = |base: &Vec<u64>| -> Result<Vec<u8>> {
+            let mut chunk = vec![0u8; chunk_bytes];
+            super::reader::gather_chunk(data, &d.dims, chunk_dims, base, elem_size, &mut chunk);
+            if raw_filters.is_empty() {
+                Ok(chunk)
+            } else {
+                filt::apply(raw_filters, elem_size, &chunk)
+            }
+        };
+        let batch = (crate::par::num_threads() * 4).max(16);
+        for group in bases.chunks(batch) {
+            for (base, filtered) in group.iter().zip(crate::par::map(group, encode)) {
+                let filtered = filtered?;
+                let size = filtered.len() as u32;
+                let addr = self.append(&filtered);
+                let mut offsets = base.clone();
+                offsets.push(0);
+                chunk_entries.push(ChunkRec {
+                    offsets,
+                    size,
+                    filter_mask: 0,
+                    addr,
+                });
+            }
+        }
+        Ok(chunk_entries)
+    }
+
+    /// A v1 B-tree over `chunk_entries` (row-major order); returns its address.
+    fn write_chunk_index(
+        &mut self,
+        chunk_entries: &[ChunkRec],
+        rank: usize,
+        chunk_dims: &[u64],
+        elem_size: usize,
+    ) -> Result<u64> {
         // Encode a chunk key.
         let key_size = 8 + (rank + 1) * 8;
         let enc_key = |size: u32, mask: u32, offs: &[u64]| -> Vec<u8> {
@@ -736,7 +1002,7 @@ impl<'a> Writer<'a> {
             addr: u64,
         }
         let mut nodes: Vec<BtNode> = Vec::new();
-        let groups: Vec<&[ChunkEntry]> = if chunk_entries.is_empty() {
+        let groups: Vec<&[ChunkRec]> = if chunk_entries.is_empty() {
             vec![&[][..]]
         } else {
             chunk_entries.chunks(cap).collect()
@@ -1084,7 +1350,8 @@ impl<'a> Writer<'a> {
     ) -> Result<(u64, Vec<Vec<u8>>)> {
         const FRHP_SIZE: usize = 4 + 1 + 2 + 2 + 1 + 4 + 8 * 12 + 2 + 8 + 8 + 2 + 2 + 8 + 2 + 4;
         self.buf.pad8();
-        let fheap_addr = self.buf.len() as u64;
+        let fheap_pos = self.buf.len();
+        let fheap_addr = self.origin + fheap_pos as u64;
         self.buf.zeros(FRHP_SIZE);
 
         let heap_off_size = max_heap_bits.div_ceil(8);
@@ -1234,8 +1501,7 @@ impl<'a> Writer<'a> {
         let sum = super::checksum::checksum(&h.bytes);
         h.u32(sum);
         debug_assert_eq!(h.len(), FRHP_SIZE);
-        self.buf.bytes[fheap_addr as usize..fheap_addr as usize + FRHP_SIZE]
-            .copy_from_slice(&h.bytes);
+        self.buf.bytes[fheap_pos..fheap_pos + FRHP_SIZE].copy_from_slice(&h.bytes);
         Ok((fheap_addr, heap_ids))
     }
 
@@ -1287,7 +1553,12 @@ impl<'a> Writer<'a> {
             let gcol = self.write_gheap(&attr.vlen);
             self.fixup_vlen(&attr.dtype.clone(), &mut data, attr.num_elements(), gcol);
         }
-        let dt = datatype::encode(&attr.dtype);
+        let dt = if let Some(refs) = &attr.refs {
+            data = self.resolve_refs(refs)?;
+            datatype::encode_object_reference()
+        } else {
+            datatype::encode(&attr.dtype)
+        };
         let ds = encode_dataspace(
             &attr.dims,
             &attr.dims.iter().map(|&d| Some(d)).collect::<Vec<_>>(),
@@ -1321,7 +1592,12 @@ impl<'a> Writer<'a> {
         b.u8(1); // version 1
         b.u8(0); // reserved
         let name_len = attr.name.len() + 1; // incl. NUL
-        let dt = datatype::encode(&attr.dtype);
+        let dt = if let Some(refs) = &attr.refs {
+            data = self.resolve_refs(refs)?;
+            datatype::encode_object_reference()
+        } else {
+            datatype::encode(&attr.dtype)
+        };
         let ds = encode_dataspace(
             &attr.dims,
             &attr.dims.iter().map(|&d| Some(d)).collect::<Vec<_>>(),
@@ -1571,57 +1847,6 @@ impl HeapBuilder {
         }
         self.offsets.insert(s.to_string(), off);
         off
-    }
-}
-
-/// Copy the elements belonging to one chunk out of a row-major logical array.
-fn gather_chunk(
-    data: &[u8],
-    dims: &[u64],
-    chunk_dims: &[u64],
-    base: &[u64],
-    elem_size: usize,
-    out: &mut [u8],
-) {
-    let rank = dims.len();
-    if rank == 0 {
-        let n = elem_size.min(data.len()).min(out.len());
-        out[..n].copy_from_slice(&data[..n]);
-        return;
-    }
-    let mut strides = vec![1u64; rank];
-    for i in (0..rank - 1).rev() {
-        strides[i] = strides[i + 1] * dims[i + 1];
-    }
-    let mut cstrides = vec![1u64; rank];
-    for i in (0..rank - 1).rev() {
-        cstrides[i] = cstrides[i + 1] * chunk_dims[i + 1];
-    }
-    let chunk_total: usize = chunk_dims.iter().map(|&c| c as usize).product();
-    let mut coord = vec![0u64; rank];
-    for lin in 0..chunk_total {
-        let mut rem = lin as u64;
-        for i in 0..rank {
-            coord[i] = rem / cstrides[i];
-            rem %= cstrides[i];
-        }
-        let mut inside = true;
-        let mut global_lin = 0u64;
-        for i in 0..rank {
-            let g = base[i] + coord[i];
-            if g >= dims[i] {
-                inside = false;
-                break;
-            }
-            global_lin += g * strides[i];
-        }
-        if inside {
-            let src = (global_lin as usize) * elem_size;
-            let dst = lin * elem_size;
-            if src + elem_size <= data.len() {
-                out[dst..dst + elem_size].copy_from_slice(&data[src..src + elem_size]);
-            }
-        }
     }
 }
 

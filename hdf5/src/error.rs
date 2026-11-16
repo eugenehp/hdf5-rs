@@ -245,7 +245,7 @@ impl H5ErrorCode for crate::h5i::hid_t {
     }
 }
 
-impl H5ErrorCode for libc::c_int {
+impl H5ErrorCode for core::ffi::c_int {
     fn is_err_code(value: Self) -> bool {
         value < 0
     }

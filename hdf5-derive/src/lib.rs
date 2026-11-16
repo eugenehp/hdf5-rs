@@ -107,7 +107,6 @@ fn is_phantom_data(ty: &Type) -> bool {
             ref path,
         }) => path
             .segments
-            .iter()
             .last()
             .is_some_and(|x| x.ident == "PhantomData"),
         _ => false,

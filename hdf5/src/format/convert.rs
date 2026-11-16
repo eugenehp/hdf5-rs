@@ -19,6 +19,16 @@ use hdf5_types::{CompoundType, TypeDescriptor};
 
 use crate::error::Result;
 
+/// Width of a pointer / `usize` in this target's memory layout (8 on 64-bit,
+/// 4 on wasm32): `char*` strings and `hvl_t { len: usize, ptr }` are laid out
+/// with it, so it must never be hard-coded.
+const PTR: usize = std::mem::size_of::<usize>();
+
+/// A `usize`/pointer read from memory-layout bytes at `off`.
+fn read_word(s: &[u8], off: usize) -> usize {
+    usize::from_ne_bytes(s[off..off + PTR].try_into().unwrap())
+}
+
 /// Size of one element of `desc` in the on-disk/model layout.
 pub fn disk_size(desc: &TypeDescriptor) -> usize {
     match desc {
@@ -267,6 +277,177 @@ fn check_compatible(src: &TypeDescriptor, dst: &TypeDescriptor) -> Result<()> {
     }
 }
 
+/// A plain number type, as stored: little-endian in the model, native in
+/// user memory (the same on every little-endian target).
+trait Prim: Copy {
+    const N: usize;
+    fn get(b: &[u8]) -> Self;
+    fn put(self, b: &mut [u8]);
+}
+
+/// The conversion libhdf5's hard paths (`H5T_conv_*`) perform: integers
+/// saturate to the destination range (negative → 0 for unsigned), floats
+/// go through `as` — which already saturates, maps NaN to 0 and ±Inf to
+/// MAX/MIN, like the C library.
+trait Sat<D> {
+    fn sat(self) -> D;
+}
+
+macro_rules! prim {
+    ($($t:ty),*) => {$(
+        impl Prim for $t {
+            const N: usize = std::mem::size_of::<$t>();
+            #[inline(always)]
+            fn get(b: &[u8]) -> Self {
+                <$t>::from_le_bytes(b.try_into().unwrap())
+            }
+            #[inline(always)]
+            fn put(self, b: &mut [u8]) {
+                b.copy_from_slice(&self.to_le_bytes())
+            }
+        }
+    )*};
+}
+prim!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
+
+macro_rules! sat_int {
+    ($s:ty => $($d:ty),*) => {$(
+        impl Sat<$d> for $s {
+            #[inline(always)]
+            #[allow(unused_comparisons)]
+            fn sat(self) -> $d {
+                match <$d>::try_from(self) {
+                    Ok(v) => v,
+                    Err(_) if self < 0 => <$d>::MIN,
+                    Err(_) => <$d>::MAX,
+                }
+            }
+        }
+    )*};
+}
+macro_rules! sat_as {
+    ($s:ty => $($d:ty),*) => {$(
+        impl Sat<$d> for $s {
+            #[inline(always)]
+            fn sat(self) -> $d {
+                self as $d
+            }
+        }
+    )*};
+}
+macro_rules! sat_all {
+    ($($s:ty),*) => {$(
+        sat_int!($s => i8, i16, i32, i64, u8, u16, u32, u64);
+        sat_as!($s => f32, f64);
+    )*};
+}
+sat_all!(i8, i16, i32, i64, u8, u16, u32, u64);
+sat_as!(f32 => i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
+sat_as!(f64 => i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
+
+/// Converts to every plain number type.
+trait ToAll:
+    Prim
+    + Sat<i8>
+    + Sat<i16>
+    + Sat<i32>
+    + Sat<i64>
+    + Sat<u8>
+    + Sat<u16>
+    + Sat<u32>
+    + Sat<u64>
+    + Sat<f32>
+    + Sat<f64>
+{
+}
+impl<T> ToAll for T where
+    T: Prim
+        + Sat<i8>
+        + Sat<i16>
+        + Sat<i32>
+        + Sat<i64>
+        + Sat<u8>
+        + Sat<u16>
+        + Sat<u32>
+        + Sat<u64>
+        + Sat<f32>
+        + Sat<f64>
+{
+}
+
+/// One tight, vectorizable loop per type pair — split over threads for big
+/// buffers.
+fn cast<S: Sat<D> + Prim, D: Prim>(data: &[u8], out: &mut [u8]) {
+    crate::par::zip_units(data, S::N, out, D::N, |s, d| {
+        for (s, d) in s.chunks_exact(S::N).zip(d.chunks_exact_mut(D::N)) {
+            S::get(s).sat().put(d);
+        }
+    });
+}
+
+fn cast_from<S: ToAll>(dst: &TypeDescriptor, data: &[u8], out: &mut [u8]) -> bool {
+    use hdf5_types::{FloatSize, IntSize};
+    use TypeDescriptor::*;
+    match dst {
+        Integer(IntSize::U1) => cast::<S, i8>(data, out),
+        Integer(IntSize::U2) => cast::<S, i16>(data, out),
+        Integer(IntSize::U4) => cast::<S, i32>(data, out),
+        Integer(IntSize::U8) => cast::<S, i64>(data, out),
+        Unsigned(IntSize::U1) => cast::<S, u8>(data, out),
+        Unsigned(IntSize::U2) => cast::<S, u16>(data, out),
+        Unsigned(IntSize::U4) => cast::<S, u32>(data, out),
+        Unsigned(IntSize::U8) => cast::<S, u64>(data, out),
+        Float(FloatSize::U4) => cast::<S, f32>(data, out),
+        Float(FloatSize::U8) => cast::<S, f64>(data, out),
+        _ => return false,
+    }
+    true
+}
+
+/// Whether [`convert_numbers`] handles this pair.
+pub(crate) fn numbers_convertible(src: &TypeDescriptor, dst: &TypeDescriptor) -> bool {
+    use hdf5_types::FloatSize;
+    use TypeDescriptor::*;
+    let plain = |t: &TypeDescriptor| {
+        matches!(
+            t,
+            Integer(_) | Unsigned(_) | Float(FloatSize::U4 | FloatSize::U8)
+        )
+    };
+    plain(src) && plain(dst)
+}
+
+/// Convert plain numbers (`data`: `src` elements) into `out` (`dst`
+/// elements, sized by the caller) in one pass. `false` if either side is not
+/// a plain integer/float, leaving `out` untouched.
+pub(crate) fn convert_numbers(
+    src: &TypeDescriptor,
+    dst: &TypeDescriptor,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    use hdf5_types::{FloatSize, IntSize};
+    use TypeDescriptor::*;
+    if src == dst && matches!(src, Integer(_) | Unsigned(_) | Float(_)) {
+        let n = data.len().min(out.len());
+        crate::par::zip_units(&data[..n], 1, &mut out[..n], 1, |s, d| d.copy_from_slice(s));
+        return true;
+    }
+    match src {
+        Integer(IntSize::U1) => cast_from::<i8>(dst, data, out),
+        Integer(IntSize::U2) => cast_from::<i16>(dst, data, out),
+        Integer(IntSize::U4) => cast_from::<i32>(dst, data, out),
+        Integer(IntSize::U8) => cast_from::<i64>(dst, data, out),
+        Unsigned(IntSize::U1) => cast_from::<u8>(dst, data, out),
+        Unsigned(IntSize::U2) => cast_from::<u16>(dst, data, out),
+        Unsigned(IntSize::U4) => cast_from::<u32>(dst, data, out),
+        Unsigned(IntSize::U8) => cast_from::<u64>(dst, data, out),
+        Float(FloatSize::U4) => cast_from::<f32>(dst, data, out),
+        Float(FloatSize::U8) => cast_from::<f64>(dst, data, out),
+        _ => false,
+    }
+}
+
 /// Convert `n` elements from model/disk layout into user-memory layout.
 ///
 /// The returned buffer is laid out per `dst` (`dst.size()` stride) and any
@@ -283,6 +464,9 @@ pub fn model_to_mem(
     let ssize = disk_size(src);
     let dsize = dst.size();
     let mut out = vec![0u8; n * dsize];
+    if data.len() >= n * ssize && convert_numbers(src, dst, &data[..n * ssize], &mut out) {
+        return Ok(out);
+    }
     for i in 0..n {
         let s = data
             .get(i * ssize..(i + 1) * ssize)
@@ -313,7 +497,7 @@ fn elem_to_mem(
             };
             let len = (len as usize).min(bytes.len());
             let ptr = unsafe {
-                let p = libc::malloc(len + 1).cast::<u8>();
+                let p = hdf5_types::malloc(len + 1).cast::<u8>();
                 if p.is_null() {
                     return Err("out of memory".into());
                 }
@@ -337,7 +521,7 @@ fn elem_to_mem(
                     .unwrap_or(&[])
             };
             let ptr = unsafe {
-                let p = libc::malloc((n * dst_stride).max(1)).cast::<u8>();
+                let p = hdf5_types::malloc((n * dst_stride).max(1)).cast::<u8>();
                 if p.is_null() {
                     return Err("out of memory".into());
                 }
@@ -352,8 +536,8 @@ fn elem_to_mem(
                 elem_to_mem(sb, db, sd, dd, store)?;
             }
             // hvl_t { len: usize, ptr }
-            d[..8].copy_from_slice(&(n as u64).to_le_bytes());
-            d[8..16].copy_from_slice(&(ptr as usize).to_ne_bytes());
+            d[..PTR].copy_from_slice(&n.to_ne_bytes());
+            d[PTR..2 * PTR].copy_from_slice(&(ptr as usize).to_ne_bytes());
         }
         (Compound(sc), Compound(dc)) => {
             for df in &dc.fields {
@@ -392,7 +576,7 @@ fn elem_to_mem(
             let end = s.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
             let bytes = &s[..end];
             let ptr = unsafe {
-                let p = libc::malloc(bytes.len() + 1).cast::<u8>();
+                let p = hdf5_types::malloc(bytes.len() + 1).cast::<u8>();
                 if p.is_null() {
                     return Err("out of memory".into());
                 }
@@ -446,6 +630,9 @@ pub fn mem_to_model(
     let ssize = src.size();
     let dsize = disk_size(dst);
     let mut out = vec![0u8; n * dsize];
+    if data.len() >= n * ssize && convert_numbers(src, dst, &data[..n * ssize], &mut out) {
+        return Ok(out);
+    }
     for i in 0..n {
         let s = data
             .get(i * ssize..(i + 1) * ssize)
@@ -465,7 +652,7 @@ fn elem_to_model(
     use TypeDescriptor::*;
     match (src, dst) {
         (VarLenAscii | VarLenUnicode, VarLenAscii | VarLenUnicode) => {
-            let ptr = usize::from_ne_bytes(s[..8].try_into().unwrap()) as *const u8;
+            let ptr = read_word(s, 0) as *const u8;
             let bytes = if ptr.is_null() {
                 Vec::new()
             } else {
@@ -489,8 +676,9 @@ fn elem_to_model(
             d.copy_from_slice(&model_slot(len, idx));
         }
         (VarLenArray(sb), VarLenArray(db)) => {
-            let len = u64::from_le_bytes(s[..8].try_into().unwrap()) as usize;
-            let ptr = usize::from_ne_bytes(s[8..16].try_into().unwrap()) as *const u8;
+            // hvl_t { len: usize, ptr }
+            let len = read_word(s, 0);
+            let ptr = read_word(s, PTR) as *const u8;
             let src_stride = sb.size();
             let dst_stride = disk_size(db);
             let mut buf = vec![0u8; len * dst_stride];
@@ -562,7 +750,7 @@ fn elem_to_model(
             d.copy_from_slice(&model_slot(len, idx));
         }
         (VarLenAscii | VarLenUnicode, FixedAscii(_) | FixedUnicode(_)) => {
-            let ptr = usize::from_ne_bytes(s[..8].try_into().unwrap()) as *const u8;
+            let ptr = read_word(s, 0) as *const u8;
             let mut n = 0usize;
             unsafe {
                 while n < d.len() && !ptr.is_null() && *ptr.add(n) != 0 {

@@ -249,7 +249,8 @@ impl PropertyList {
     }
 }
 
-/// No-op: vlen memory always uses libc malloc/free in this implementation.
+/// No-op: vlen memory always uses `hdf5_types::{malloc, free}` in this implementation
+/// (kept for API compatibility with the C-backed crate).
 pub fn set_vlen_manager_libc(_plist: crate::h5i::hid_t) -> crate::error::Result<()> {
     Ok(())
 }

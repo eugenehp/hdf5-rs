@@ -150,6 +150,14 @@ def verify_rust(d):
             assert list(f["bloscd"][()]) == list(range(400))
     except ImportError:
         pass
+    # rust-written object references dereference to the right objects
+    with h5py.File(f"{d}/rust_refs.h5", "r") as f:
+        col = f["table/group"]
+        assert col.dtype == h5py.ref_dtype, col.dtype
+        assert [f[r].name for r in col[()]] == ["/devices/a", "/devices/b", "/devices/a"]
+        assert f[f["acquisition/electrodes"].attrs["table"]].name == "/table"
+        assert [f[r].name for r in f["values"].attrs["sources"]] == ["/devices/b", "/acquisition/electrodes"]
+        assert list(f["values"][()]) == [1.0, 2.0, 3.0]
     print("rust-written file verified by h5py")
 
 

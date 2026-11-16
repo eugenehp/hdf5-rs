@@ -6,16 +6,19 @@ use std::slice;
 use crate::h5type::{hvl_t, CompoundType, EnumType, FloatSize, H5Type, IntSize, TypeDescriptor};
 use crate::string::{VarLenAscii, VarLenUnicode};
 
+// Compound fields sit at arbitrary byte offsets of a packed buffer, so a field
+// is generally NOT aligned for its type: read and write it unaligned (a typed
+// `*ptr` load there is undefined behaviour, and traps on strict-alignment targets).
 fn read_raw<T: Copy>(buf: &[u8]) -> T {
-    debug_assert_eq!(mem::size_of::<T>(), buf.len());
-    unsafe { *(buf.as_ptr().cast::<T>()) }
+    assert_eq!(mem::size_of::<T>(), buf.len());
+    // SAFETY: `buf` holds exactly `size_of::<T>()` bytes; any alignment.
+    unsafe { buf.as_ptr().cast::<T>().read_unaligned() }
 }
 
 fn write_raw<T: Copy>(out: &mut [u8], value: T) {
-    debug_assert_eq!(mem::size_of::<T>(), out.len());
-    unsafe {
-        *(out.as_mut_ptr().cast()) = value;
-    }
+    assert_eq!(mem::size_of::<T>(), out.len());
+    // SAFETY: `out` holds exactly `size_of::<T>()` bytes; any alignment.
+    unsafe { out.as_mut_ptr().cast::<T>().write_unaligned(value) }
 }
 
 unsafe trait DynDrop {
@@ -419,9 +422,9 @@ unsafe impl DynClone for DynArray<'_> {
             unsafe {
                 let dst = crate::malloc(len * size).cast();
                 ptr::copy_nonoverlapping(ptr, dst, len * size);
-                // Alignment is always at least usize for pointers from `hdf5-c`
+                // the `hvl_t` sits in a packed buffer: write its `ptr` unaligned
                 let outptr = out.as_mut_ptr().cast::<hvl_t>();
-                ptr::write(ptr::addr_of_mut!((*outptr).ptr), dst.cast());
+                ptr::addr_of_mut!((*outptr).ptr).write_unaligned(dst.cast());
                 slice::from_raw_parts_mut(dst, len * size)
             }
         } else {
@@ -558,14 +561,21 @@ impl<'a> DynVarLenString<'a> {
         }
     }
 
-    fn as_ascii(&self) -> &VarLenAscii {
-        // Alignment is always at least usize for pointers from `hdf5-c`
-        unsafe { &*(self.buf.as_ptr().cast::<VarLenAscii>()) }
+    // The `char*` sits at the field's byte offset in a packed buffer, which need
+    // not be pointer-aligned: read a bitwise copy (never dropped — `buf` still
+    // owns the string) instead of forming a misaligned reference.
+    fn as_ascii(&self) -> mem::ManuallyDrop<VarLenAscii> {
+        assert_eq!(self.buf.len(), mem::size_of::<VarLenAscii>());
+        // SAFETY: `buf` holds one `char*`; `VarLenAscii` is that pointer.
+        mem::ManuallyDrop::new(unsafe { self.buf.as_ptr().cast::<VarLenAscii>().read_unaligned() })
     }
 
-    fn as_unicode(&self) -> &VarLenUnicode {
-        // Alignment is always at least usize for pointers from `hdf5-c`
-        unsafe { &*(self.buf.as_ptr().cast::<VarLenUnicode>()) }
+    fn as_unicode(&self) -> mem::ManuallyDrop<VarLenUnicode> {
+        assert_eq!(self.buf.len(), mem::size_of::<VarLenUnicode>());
+        // SAFETY: as `as_ascii`.
+        mem::ManuallyDrop::new(unsafe {
+            self.buf.as_ptr().cast::<VarLenUnicode>().read_unaligned()
+        })
     }
 }
 
@@ -588,9 +598,10 @@ unsafe impl DynClone for DynVarLenString<'_> {
                 let dst = crate::malloc(raw_len + 1).cast();
                 ptr::copy_nonoverlapping(self.get_ptr(), dst, raw_len);
                 dst.add(raw_len).write(0);
-                // Alignment is always at least usize for pointers from `hdf5-c`
-                let outptr = out.as_mut_ptr().cast::<*const u8>();
-                ptr::write(outptr, dst.cast());
+                // the output field need not be pointer-aligned either
+                out.as_mut_ptr()
+                    .cast::<*const u8>()
+                    .write_unaligned(dst.cast());
             }
         }
     }
@@ -599,8 +610,8 @@ unsafe impl DynClone for DynVarLenString<'_> {
 impl PartialEq for DynVarLenString<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (self.unicode, other.unicode) {
-            (true, true) => self.as_unicode() == other.as_unicode(),
-            (false, false) => self.as_ascii() == other.as_ascii(),
+            (true, true) => *self.as_unicode() == *other.as_unicode(),
+            (false, false) => *self.as_ascii() == *other.as_ascii(),
             _ => false,
         }
     }
@@ -611,9 +622,9 @@ impl Eq for DynVarLenString<'_> {}
 impl Debug for DynVarLenString<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.unicode {
-            Debug::fmt(&self.as_unicode(), f)
+            Debug::fmt(&*self.as_unicode(), f)
         } else {
-            Debug::fmt(&self.as_ascii(), f)
+            Debug::fmt(&*self.as_ascii(), f)
         }
     }
 }

@@ -105,6 +105,25 @@ fn write(dir: &str) -> hdf5::Result<()> {
     s.link_external("rust_ext_target.h5", "/data", "borrowed")?;
     s.close()?;
 
+    // object references (H5R_OBJECT): a column of them, a scalar attribute
+    // and an array attribute, targets written before and after
+    let r = File::create(format!("{dir}/rust_refs.h5"))?;
+    let a = r.create_group("devices/a")?;
+    let b = r.create_group("devices/b")?;
+    let table = r.create_group("table")?;
+    table.new_reference_dataset("group", &[&a, &b, &a])?;
+    let region = r
+        .create_group("acquisition")?
+        .new_dataset::<i32>()
+        .shape([2])
+        .create("electrodes")?;
+    region.write(&[0, 2])?;
+    region.new_reference_attr("table", &table)?;
+    let values = r.new_dataset::<f64>().shape([3]).create("values")?;
+    values.write(&[1.0, 2.0, 3.0])?;
+    values.new_reference_array_attr("sources", &[&b, &region])?;
+    r.close()?;
+
     println!("rust_all.h5 written");
     Ok(())
 }

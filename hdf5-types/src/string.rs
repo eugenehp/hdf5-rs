@@ -225,7 +225,7 @@ impl VarLenAscii {
 
     #[inline]
     pub fn len(&self) -> usize {
-        unsafe { libc::strlen(self.ptr as *const _) }
+        unsafe { crate::strlen(self.ptr as *const u8) }
     }
 
     #[inline]
@@ -333,7 +333,7 @@ impl VarLenUnicode {
 
     #[inline]
     unsafe fn raw_len(&self) -> usize {
-        libc::strlen(self.ptr as *const _)
+        crate::strlen(self.ptr as *const u8)
     }
 
     #[inline]

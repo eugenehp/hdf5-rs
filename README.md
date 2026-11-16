@@ -53,6 +53,7 @@ fn main() -> hdf5::Result<()> {
 | `hdf5-no-c` (lib name `hdf5`, folder `hdf5/`) | High-level API (drop-in surface of the FFI crate) + the pure-Rust format engine |
 | `hdf5-no-c-types` (lib name `hdf5_types`, folder `hdf5-types/`) | Native Rust equivalents of HDF5 types (`H5Type`, `TypeDescriptor`, vlen/fixed strings & arrays, dynamic values) |
 | `hdf5-no-c-derive` (lib name `hdf5_derive`, folder `hdf5-derive/`) | `#[derive(H5Type)]` for structs, tuple structs and enums |
+| `hdf5-no-c-wasm` (folder `hdf5-wasm/`, npm via `wasm-pack`) | JavaScript bindings: read/write in the browser and Node, remote files over HTTP range requests ([README](hdf5-wasm/README.md)) |
 
 All three packages carry the `-no-c` prefix on crates.io (the unprefixed
 names are taken by the FFI project), while every **library** keeps its
@@ -107,6 +108,171 @@ let out = y.to_vec();                              // compiled forward pass
 | `f16` | Half-precision floats (`half`) |
 
 MSRV: 1.85. No build scripts, no C toolchain, no `HDF5_DIR` probing.
+
+## Performance: SIMD and parallelism
+
+Always on, no feature flag, no extra dependencies:
+
+- **Parallel chunk I/O.** Reading decodes chunks on every core, then scatters
+  them in parallel by row band: `out` is split at band edges, so each worker
+  owns the bytes it writes, with no locks or `unsafe`. Writing gathers and
+  filters chunks in parallel, then appends them in order, so the file is
+  byte-for-byte what one thread writes. Large byte-swaps, numeric conversions
+  and contiguous copies are split over threads too. Work runs on a small
+  persistent pool, so a small read costs a queue push per helper, not a
+  thread start. `hdf5::set_num_threads(n)` or `HDF5_NO_C_THREADS=n` sets the
+  worker count (default: one per core); `1` keeps everything on the calling
+  thread. `hdf5::set_thread_spawner` hands the work to threads the
+  application owns instead (Web Workers, a custom pool).
+- **Partial reads decode only what they touch.** `read_slice` (any
+  hyperslab) and point selections read just the chunks holding a selected
+  element, or just the selected runs of contiguous data, never the whole
+  dataset. Decoded chunks are kept per dataset in an LRU cache (16 MiB
+  default, `hdf5::set_chunk_cache_size`), so neighbouring partial reads don't
+  decode the same chunk twice.
+- **One pass per read.** Decoding, byte-swapping (big-endian data) and type
+  conversion (e.g. `i16` on disk read as `f32`) happen as each chunk is
+  placed, not as separate passes over a full-size intermediate copy. The
+  filter pipeline borrows its input and sizes buffers from the known chunk
+  size.
+- **SIMD kernels** (`format/simd.rs`). The shuffle filter (both directions,
+  element sizes 2/4/8/16) is written as a byte-zip/unzip "perfect shuffle"
+  for NEON (aarch64), SSE2 (x86_64), AVX2 (x86_64: two 16-element groups per
+  256-bit vector, used where calibration shows it faster) and wasm `simd128`. Scale-offset and
+  N-bit decode read each packed field through one 128-bit window instead of
+  bit-by-bit. Fletcher32 uses a
+  closed-form block sum the compiler vectorizes. Byte-swaps and every numeric
+  conversion pair (all 100 integer/float combinations, with libhdf5's
+  saturating semantics) are tight typed loops that auto-vectorize; on wasm,
+  explicit `simd128` kernels cover the cases LLVM leaves scalar. Each vector
+  path is tested against its scalar reference.
+- **Run-based chunk scatter/gather.** Chunk ↔ dataset copies move whole
+  contiguous runs, with fixed-size moves for narrow runs (column chunks).
+- **Metadata parsing** reads fields from a cached window of the source,
+  not through one dynamic call and lock per field. Range readers check the
+  last block used without taking a lock, address maps use a multiply hash
+  instead of SipHash, and the per-object arena slot shrank from 440 bytes to
+  about 100 (dataset descriptions are boxed).
+
+`examples/bench_read.rs` on a 4M×8 `i16` file written by h5py
+(`python3 interop/make_bench.py bench.h5`), Apple M-series, 14 threads, best
+of 3. It also checks that every layout decodes to the same values:
+
+| Workload | Before | After | After, 1 thread |
+|---|---:|---:|---:|
+| contiguous read | 5.1 ms | 2.1 ms | 5.2 ms |
+| gzip + shuffle, row chunks | 15.6 ms | 14.3 ms | 103 ms |
+| gzip + shuffle, column chunks | 133 ms | 18.8 ms | 116 ms |
+| shuffle + fletcher32 `f32` | 10.2 ms | 7.1 ms | 23.8 ms |
+| big-endian `f64` (256 MB) | 66.4 ms | 10.3 ms | 25.2 ms |
+| `i16` read as `f32` | 176 ms | 3.8 ms | 7.3 ms |
+| gzip + shuffle **write** (64 MB) | 895 ms | 70.5 ms | 510 ms |
+| walk 20k groups (attr + shape) | 64.1 ms | 47.1 ms | 46.7 ms |
+
+Kernel throughput (`cargo test --release -p hdf5-no-c simd::tests::throughput
+-- --ignored --nocapture`), GB/s, on a 1 MiB chunk in cache:
+
+| Kernel | AMD Ryzen 9 8945HS | Intel i9-12900H | scalar |
+|---|---:|---:|---:|
+| shuffle 4 (AVX2 / SSE2) | 57.8 / 29.2 | 32.9 / 25.3 | ~1.5 |
+| unshuffle 8 (AVX2 / SSE2) | 51.7 / 25.3 | 31.5 / 31.1 | — |
+| fletcher32 | 45.7 | 39.2 | 4.3 |
+
+AVX2's byte shuffles beat SSE2's on Zen 4 but not always on Alder Lake.
+Intel issues 128-bit byte shuffles on two ports and 256-bit ones on one,
+so AVX2 unshuffle is up to ~30% slower there. On first use the library
+times both on a chunk-sized buffer and keeps AVX2 only where it is at
+least 10% faster (once per process, a few milliseconds). Fletcher32 on
+x86 uses `pmaddwd` (SSE2/AVX2) on bias-shifted words, which is about 5×
+the compiler's own vectorization. Blosc's byte shuffle and bitshuffle use
+the same kernels. On wasm `simd128`: fletcher32 2.4 → 10.8 GB/s, 8-byte
+swap 7.8 → 33.
+
+Tested on macOS (aarch64, plus x86_64 under Rosetta), Linux x86_64 on Intel
+and AMD (the full workspace suite, h5py interop in both directions, and the
+benchmarks), wasm32-wasip1 (with and without SIMD), wasm32-wasip1-threads,
+and headless Chrome (`hdf5-wasm/tests/browser.html`).
+
+## Streaming writes
+
+Writable files on disk (`File::create`, `open_rw`, `append`) are never
+rebuilt in memory:
+
+- **Flushes append.** What changed goes after the current end of the file,
+  followed by fresh metadata, and only the superblock is rewritten. Data
+  already in the file stays where it is (chunks are re-indexed, not
+  re-encoded), and a file opened and closed without changes is not written
+  at all.
+- **Written datasets leave memory.** After a flush, each written dataset is
+  a view of the file, like a dataset of a file opened for reading.
+- **Chunk writes go straight to disk.** `write_slice` (or any write) into a
+  chunked dataset decodes only the chunks it touches, updates them,
+  re-encodes them in parallel and appends them to the file. `resize` of a
+  chunked dataset only changes its shape. Recording loops
+  (`resize` + `write_slice` + an occasional `flush`) hold one block of data
+  at a time, whatever the file grows to (`examples/streaming_write.rs`).
+- **Files from other writers** are edited the same way: chunks under any of
+  libhdf5's chunk indexes (v1/v2 B-tree, fixed or extensible array) stay in
+  place under a new v1 B-tree index, and h5py reads the result.
+
+Old metadata stays in the file, unreferenced (libhdf5 reuses such space;
+this writer does not yet), so a file flushed very often carries some dead
+bytes. Rewrite it with `to_bytes()` to compact it. Files with shared-message
+tables (SOHM) fall back to a whole-file rewrite on flush.
+
+## Remote files (async range reads)
+
+`hdf5::remote::RemoteFile` reads a file through any `AsyncRangeRead`
+(`fetch` with a `Range` header, an object store, ...), with no executor
+dependency. Reads run against the bytes fetched so far. Every range an
+attempt is missing gets fetched concurrently, and the read then runs again:
+
+```rust
+let remote = RemoteFile::open(reader, 1 << 20).await?;
+let rows = remote.read(|f| f.dataset("data")?.read_rows_raw::<f32>(0, 64)).await?;
+```
+
+Opening a file takes about 2 round-trips, and a slice fetches only its
+chunks. For example, 64 rows of a gzip column-chunked dataset in a 641 MB file
+written by h5py came over HTTP in 6 MB. `hdf5-wasm`'s `H5Remote` wraps this
+for JavaScript.
+
+## WebAssembly
+
+The crate builds and passes its test suite on `wasm32-unknown-unknown` (the
+browser), `wasm32-wasip1` and `wasm32-wasip1-threads`, with or without
+`simd128`. The [`hdf5-wasm`](hdf5-wasm/README.md) package wraps it for
+JavaScript.
+
+- **Browser** (`wasm32-unknown-unknown`): there is no file system, so files
+  live in memory. `File::from_bytes(bytes)` opens bytes you already have,
+  e.g. from `fetch` or a browser `File` (read-only and zero-copy; objects
+  are parsed as they are reached). `File::from_bytes_rw` opens them for
+  editing, `File::create_in_memory` builds a new file, and `to_bytes()`
+  exports either one. `File::open_reader` takes any `Read + Seek`. Without a
+  clock, object times are 0. Without threads, everything runs inline.
+- **WASI** (`wasm32-wasip1`): path-based `File::open`/`create` work against
+  preopened directories. WASI has no mmap, so files are read into memory.
+- **SIMD**: build with `RUSTFLAGS="-C target-feature=+simd128"` to get the
+  wasm vector kernels (supported by all current browsers, Node and wasmtime).
+- **Threads** (`wasm32-wasip1-threads`, `-C target-feature=+atomics`): chunk
+  work runs on the persistent pool. Whether threads exist is found out at
+  run time (a host that refuses the first spawn gets inline execution), and
+  the crate's locks are `std::sync` on wasm, which blocks correctly there
+  (`parking_lot` cannot park without `cfg(target_feature = "atomics")`).
+  The default count is 1 (WASI reports no cores), so set
+  `HDF5_NO_C_THREADS`. In the browser, plug Web Workers in with
+  `set_thread_spawner`.
+
+```bash
+# browser target, under Node (wasm-bindgen-test-runner must match the
+# lockfile's wasm-bindgen version)
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo test -p hdf5-no-c --target wasm32-unknown-unknown --test wasm
+# the whole test suite on WASI, under Node's WASI
+CARGO_TARGET_WASM32_WASIP1_RUNNER="node $PWD/interop/wasi_run.mjs" \
+  cargo test -p hdf5-no-c --target wasm32-wasip1 --features zlib,szip
+```
 
 ## What works
 
@@ -221,8 +387,9 @@ python3 interop/check_h5py.py verify /tmp/interop
 - `Dataset::offset()` returns `None` (addresses are assigned at serialization).
 - Error *messages* differ from libhdf5's error-stack text; `ErrorStack` exists
   for API compatibility but carries no C frames.
-- The file is held in memory while open and serialized on flush/close/drop —
-  ideal for small/medium files; not yet suited to files larger than RAM.
+- Writable files are flushed incrementally (see *Streaming writes*); dead
+  metadata from earlier flushes is not reclaimed. In-memory files
+  (`create_in_memory`, `from_bytes_rw`) are serialized whole by `to_bytes`.
 - Objects reached through external links are read-only (libhdf5 allows
   writes through them).
 - Non-contiguous `ndarray` views must be standardized by the caller before
@@ -273,7 +440,7 @@ python3 interop/check_h5py.py verify /tmp/interop
   contiguous *and chunked/filtered* datasets stay as lazy references (the
   chunk list is collected at parse, decoding happens on first access) —
   opening huge files costs metadata only, and untouched datasets never enter
-  memory or run their filters. (Writes still assemble the file in memory.)
+  memory or run their filters.
 
 ## License
 

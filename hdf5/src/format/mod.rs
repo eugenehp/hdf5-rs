@@ -13,6 +13,8 @@ pub mod convert;
 pub mod datatype;
 pub mod filters;
 pub mod reader;
+pub mod simd;
+pub mod source;
 #[cfg(feature = "szip")]
 pub mod szip;
 pub mod v2;
@@ -21,6 +23,7 @@ pub mod writer;
 
 use crate::error::Result;
 use crate::model::FileState;
+use source::ByteSource;
 
 /// HDF5 superblock signature.
 pub const SIGNATURE: [u8; 8] = [0x89, b'H', b'D', b'F', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -117,36 +120,55 @@ impl Buf {
     }
 }
 
-/// A little-endian byte-reader over an in-memory file image.
+/// A little-endian byte-reader over a [`ByteSource`] (an in-memory image or a
+/// lazy range-reader). `take` hands back a slice borrowed from the source, which
+/// keeps its bytes stable for the source's lifetime — so this reads identically
+/// whether the file is fully present or fetched block-by-block.
+///
+/// The cursor keeps the source's [`window`](ByteSource::window) around its
+/// position, so consecutive fields read straight from it.
 pub struct Cursor<'a> {
-    pub data: &'a [u8],
-    pub pos: usize,
+    pub src: &'a dyn ByteSource,
+    pub pos: u64,
+    /// `(start, bytes)` known to be at hand; empty until first needed.
+    window: (u64, &'a [u8]),
 }
 
 impl<'a> Cursor<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+    pub fn new(src: &'a dyn ByteSource) -> Self {
+        Self::at(src, 0)
     }
 
-    pub fn at(data: &'a [u8], pos: usize) -> Self {
-        Self { data, pos }
+    pub fn at(src: &'a dyn ByteSource, pos: u64) -> Self {
+        Self {
+            src,
+            pos,
+            window: (0, &[]),
+        }
     }
 
-    pub fn seek(&mut self, pos: usize) {
+    /// `[pos, pos + n)` out of the window, if it holds them.
+    #[inline]
+    fn in_window(&self, n: usize) -> Option<&'a [u8]> {
+        let (start, bytes) = self.window;
+        let rel = usize::try_from(self.pos.checked_sub(start)?).ok()?;
+        bytes.get(rel..rel.checked_add(n)?)
+    }
+
+    pub fn seek(&mut self, pos: u64) {
         self.pos = pos;
     }
 
-    pub fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.pos)
+    pub fn remaining(&self) -> u64 {
+        self.src.len().saturating_sub(self.pos)
     }
 
     pub fn eof(&self) -> bool {
-        self.pos >= self.data.len()
+        self.pos >= self.src.len()
     }
 
     pub fn u8(&mut self) -> Result<u8> {
-        let b = *self.data.get(self.pos).ok_or("unexpected end of file")?;
-        self.pos += 1;
+        let b = self.take(1)?[0];
         Ok(b)
     }
 
@@ -173,6 +195,10 @@ impl<'a> Cursor<'a> {
 
     /// Read a length-sized integer of `size` bytes (little-endian).
     pub fn uint(&mut self, size: usize) -> Result<u64> {
+        // the width comes from the file: a damaged one is an error
+        if size > 8 {
+            return Err(format!("integer field of {size} bytes (at most 8)").into());
+        }
         let s = self.take(size)?;
         let mut a = [0u8; 8];
         a[..size].copy_from_slice(s);
@@ -180,21 +206,29 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.data.len() {
-            return Err("unexpected end of file".into());
-        }
-        let s = &self.data[self.pos..self.pos + n];
-        self.pos += n;
+        let s = match self.in_window(n) {
+            Some(s) => s,
+            None => {
+                if let Some(w) = self.src.window(self.pos) {
+                    self.window = w;
+                }
+                match self.in_window(n) {
+                    Some(s) => s,
+                    None => self.src.slice(self.pos, n)?,
+                }
+            }
+        };
+        self.pos += n as u64;
         Ok(s)
     }
 
     pub fn skip(&mut self, n: usize) {
-        self.pos += n;
+        self.pos += n as u64;
     }
 
     /// Align current position up to a multiple of 8.
     pub fn align8(&mut self) {
-        self.pos = align8(self.pos);
+        self.pos = (self.pos + 7) & !7;
     }
 }
 
@@ -222,4 +256,84 @@ pub fn parse_image(
     dir: Option<&std::path::Path>,
 ) -> Result<FileState> {
     reader::parse(image, dir)
+}
+
+/// Flush a writable file incrementally: what is new goes after the current
+/// end of the file, followed by fresh metadata, and the superblock is
+/// rewritten to point at it — data already in the file stays where it is,
+/// rather than the whole file being written again. Datasets written out are
+/// then held as views of the file, not in memory.
+///
+/// `false` where only a whole-file rewrite will do (no backing file, or
+/// shared-message tables).
+pub(crate) fn flush_append(state: &mut FileState) -> Result<bool> {
+    use crate::model::{LazyData, LazyKind, ObjectKind};
+    let Some(file) = state.appendable.clone() else {
+        return Ok(false);
+    };
+    let ub = state.userblock;
+    let mut end = file.len().max(ub);
+    // the new part starts 8-aligned, as every address this crate writes is
+    let pad = (8 - (end - ub) % 8) % 8;
+    if pad > 0 {
+        file.append(&[0u8; 8][..pad as usize])?;
+        end += pad;
+    }
+    let origin = end - ub;
+    let ours = std::sync::Arc::as_ptr(&file) as *const ();
+    let in_file = |l: &LazyData| std::sync::Arc::as_ptr(&l.src) as *const () == ours;
+    let Some(out) = writer::serialize_append(state, origin, &in_file)? else {
+        return Ok(false);
+    };
+    let at = file.append(&out.tail)?;
+    debug_assert_eq!(at, end);
+    file.write_at(ub, &out.superblock)?;
+    // everything just written now lives in the file: hold views, not bytes
+    let src: std::sync::Arc<dyn ByteSource + Send + Sync> = file.clone();
+    for (id, placed) in out.placed {
+        let Some(Some(node)) = state.objects.get_mut(id) else {
+            continue;
+        };
+        let ObjectKind::Dataset(d) = &mut node.kind else {
+            continue;
+        };
+        let logical = (d.num_elements() * convert::disk_size(&d.dtype)) as u64;
+        let (kind, chunks) = match placed {
+            writer::Placed::Contiguous { addr, len } => (
+                LazyKind::Contiguous {
+                    offset: ub + addr,
+                    len,
+                },
+                None,
+            ),
+            writer::Placed::Chunked {
+                btree,
+                entries,
+                filters,
+                chunk_dims,
+                elem_size,
+            } => (
+                LazyKind::Chunked {
+                    index: reader::ChunkIndex::BtreeV1 { addr: btree },
+                    dims: d.dims.clone(),
+                    chunk_dims,
+                    elem_size,
+                    filters,
+                },
+                Some(std::sync::Arc::new(entries)),
+            ),
+        };
+        let cache = d.lazy.as_ref().map(|l| l.cache.clone()).unwrap_or_default();
+        d.data = Vec::new();
+        d.lazy = Some(LazyData {
+            src: src.clone(),
+            base: ub,
+            logical,
+            kind,
+            resolved_chunks: std::sync::Arc::new(crate::lock::RwLock::new(chunks)),
+            swap: 0,
+            cache,
+        });
+    }
+    Ok(true)
 }

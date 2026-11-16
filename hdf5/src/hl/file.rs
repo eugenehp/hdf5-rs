@@ -106,6 +106,154 @@ impl File {
         Self::open_as(filename, OpenMode::Append)
     }
 
+    /// Creates an empty file that lives only in memory — no path, nothing is
+    /// written to disk (`flush`/`close`/drop are no-ops). Get the HDF5 bytes with
+    /// [`File::to_bytes`]; reopen them with [`File::open_reader`]. This is how a
+    /// browser (wasm32, no filesystem) writes HDF5.
+    ///
+    /// ```
+    /// let f = hdf5::File::create_in_memory().unwrap();
+    /// f.new_dataset_builder().with_data(&[1i32, 2, 3]).create("x").unwrap();
+    /// let bytes = f.to_bytes().unwrap();
+    /// let g = hdf5::File::open_reader(std::io::Cursor::new(bytes)).unwrap();
+    /// assert_eq!(g.dataset("x").unwrap().read_raw::<i32>().unwrap(), [1, 2, 3]);
+    /// ```
+    pub fn create_in_memory() -> Result<Self> {
+        let mut state = FileState::new_empty();
+        state.get_mut(state.root).mtime = crate::model::now();
+        let inner = Arc::new(FileInner {
+            path: None,
+            mode: OpenMode::Create,
+            state: crate::lock::RwLock::new(state),
+            id: next_id(),
+            externals: crate::lock::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(feature = "mpi")]
+            mpi: crate::lock::Mutex::new(None),
+        });
+        Ok(File::from_handle(Handle::new(Payload::File(inner))))
+    }
+
+    /// Opens HDF5 bytes already in memory (read-only) — no file system
+    /// needed, so this is the way in on `wasm32-unknown-unknown`, e.g. with
+    /// the bytes of a `fetch` or a browser `File`. The buffer is used in
+    /// place, and objects are parsed as they are reached.
+    ///
+    /// ```
+    /// let f = hdf5::File::create_in_memory().unwrap();
+    /// f.new_dataset_builder().with_data(&[1.5f64, 2.5]).create("x").unwrap();
+    /// let g = hdf5::File::from_bytes(f.to_bytes().unwrap()).unwrap();
+    /// assert_eq!(g.dataset("x").unwrap().read_raw::<f64>().unwrap(), [1.5, 2.5]);
+    /// ```
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Result<Self> {
+        let image = Arc::new(crate::model::FileImage::Bytes(bytes.into()));
+        let source = crate::format::source::ImageSource::new(image);
+        let mut state = format::reader::parse_source_lazy(Arc::new(source), None)?;
+        state.read_only = true;
+        Ok(Self::in_memory(state, OpenMode::Read))
+    }
+
+    /// Opens HDF5 bytes in memory for editing: changes stay in memory, and
+    /// [`to_bytes`](Self::to_bytes) gives the updated file.
+    ///
+    /// ```
+    /// let f = hdf5::File::create_in_memory().unwrap();
+    /// f.new_dataset_builder().with_data(&[1u8, 2]).create("a").unwrap();
+    /// let g = hdf5::File::from_bytes_rw(f.to_bytes().unwrap()).unwrap();
+    /// g.new_dataset_builder().with_data(&[3u8]).create("b").unwrap();
+    /// let h = hdf5::File::from_bytes(g.to_bytes().unwrap()).unwrap();
+    /// assert_eq!(h.member_names().unwrap(), ["a", "b"]);
+    /// ```
+    pub fn from_bytes_rw(bytes: impl Into<Vec<u8>>) -> Result<Self> {
+        let image = Arc::new(crate::model::FileImage::Bytes(bytes.into()));
+        let mut state = format::parse_image(&image, None)?;
+        state.read_only = false;
+        Ok(Self::in_memory(state, OpenMode::ReadWrite))
+    }
+
+    fn in_memory(state: FileState, mode: OpenMode) -> Self {
+        let inner = Arc::new(FileInner {
+            path: None,
+            mode,
+            state: crate::lock::RwLock::new(state),
+            id: next_id(),
+            externals: crate::lock::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(feature = "mpi")]
+            mpi: crate::lock::Mutex::new(None),
+        });
+        File::from_handle(Handle::new(Payload::File(inner)))
+    }
+
+    /// The file serialized as HDF5 bytes (what `flush` would write), for any
+    /// file — in-memory, path-backed, or opened from a reader.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let inner = self.inner()?;
+        let mut state = inner.state.write();
+        state.force_all()?;
+        state.materialize_all()?;
+        // a lazy open leaves the user block unread
+        if state.userblock_data.is_empty() && state.userblock > 0 {
+            if let Some(loader) = state.loader.clone() {
+                let size = usize::try_from(state.userblock).map_err(|_| "user block too large")?;
+                state.userblock_data = loader.src.slice(0, size)?.to_vec();
+            }
+        }
+        format::serialize(&state)
+    }
+
+    /// Opens a file (read-only) from any `Read + Seek` source instead of a path.
+    ///
+    /// The parser reads through the source lazily, fetching only the bytes it
+    /// touches (superblock, object headers, B-tree/heap nodes) and — for lazily
+    /// materialized datasets — only the chunks actually read. Nothing is copied
+    /// up front, so this streams metadata from very large or remote files (e.g.
+    /// an HTTP range-request reader) without materializing the whole file.
+    ///
+    /// ```no_run
+    /// use std::io::Cursor;
+    /// let bytes: Vec<u8> = std::fs::read("data.h5").unwrap();
+    /// let file = hdf5::File::open_reader(Cursor::new(bytes)).unwrap();
+    /// let shape = file.dataset("acquisition/series/data").unwrap().shape();
+    /// ```
+    pub fn open_reader<R>(reader: R) -> Result<Self>
+    where
+        R: std::io::Read + std::io::Seek + Send + 'static,
+    {
+        Self::open_reader_with_block(reader, crate::format::source::DEFAULT_BLOCK)
+    }
+
+    /// [`open_reader`](Self::open_reader), fetching `block` bytes at a time (a
+    /// power of two). Over a network each read is a round-trip: larger suits
+    /// files whose metadata clusters, smaller those that scatter it through
+    /// the data, as files written while recording do.
+    pub fn open_reader_with_block<R>(reader: R, block: usize) -> Result<Self>
+    where
+        R: std::io::Read + std::io::Seek + Send + 'static,
+    {
+        Self::from_source(std::sync::Arc::new(
+            crate::format::source::RangeSource::new(reader)?.with_block(block)?,
+        ))
+    }
+
+    /// Open (read-only, lazily) from any byte source.
+    pub(crate) fn from_source(
+        src: std::sync::Arc<dyn crate::format::source::ByteSource + Send + Sync>,
+    ) -> Result<Self> {
+        // Lazy parse: only the root is read now; children are parsed on demand,
+        // so opening a huge many-object file is O(root).
+        let mut state = crate::format::reader::parse_source_lazy(src, None)?;
+        state.read_only = true;
+        let inner = Arc::new(FileInner {
+            path: None,
+            mode: OpenMode::Read,
+            state: crate::lock::RwLock::new(state),
+            id: next_id(),
+            externals: crate::lock::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(feature = "mpi")]
+            mpi: crate::lock::Mutex::new(None),
+        });
+        Ok(File::from_handle(Handle::new(Payload::File(inner))))
+    }
+
     /// Opens a file with the given mode.
     pub fn open_as<P: AsRef<Path>>(filename: P, mode: OpenMode) -> Result<Self> {
         FileBuilder::new().open_as(filename, mode)
@@ -162,11 +310,11 @@ impl File {
         if state.read_only {
             return Ok(());
         }
-        state.materialize_all()?;
-        let path = inner.path.as_ref().ok_or("file has no backing path")?;
-        let bytes = format::serialize(&state)?;
-        fs::write(path, bytes)?;
-        Ok(())
+        // an in-memory file (`create_in_memory`) has nowhere to flush to
+        let Some(path) = inner.path.as_ref() else {
+            return Ok(());
+        };
+        write_out(&mut state, path)
     }
 
     /// Closes the file, flushing pending changes.
@@ -208,10 +356,10 @@ impl File {
         let inner = Arc::new(FileInner {
             path: Some(path),
             mode: OpenMode::Create,
-            state: parking_lot::RwLock::new(state),
+            state: crate::lock::RwLock::new(state),
             id: next_id(),
-            externals: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            mpi: parking_lot::Mutex::new(None),
+            externals: crate::lock::Mutex::new(std::collections::HashMap::new()),
+            mpi: crate::lock::Mutex::new(None),
         });
         Ok(File::from_handle(Handle::new(Payload::File(inner))))
     }
@@ -262,15 +410,9 @@ impl Drop for File {
             // The FileInner Arc is shared by every object handle in the file;
             // flush whenever a File handle is dropped and the file is writable.
             let mut state = inner.state.write();
-            if !state.read_only {
-                if state.materialize_all().is_err() {
-                    return; // cannot load deferred bytes; leave the file as-is
-                }
-                if let Some(path) = inner.path.as_ref() {
-                    if let Ok(bytes) = format::serialize(&state) {
-                        let _ = fs::write(path, bytes);
-                    }
-                }
+            // an in-memory file has nowhere to go: nothing to load or encode
+            if let (false, Some(path)) = (state.read_only, inner.path.as_ref()) {
+                let _ = write_out(&mut state, path);
             }
         }
     }
@@ -389,15 +531,30 @@ impl FileBuilder {
                         format!("unable to open file: '{}' (not found)", path.display()).into(),
                     );
                 }
-                // memory-map the file: the OS pages data in on demand and
-                // lazily-referenced datasets avoid up-front copies entirely
-                let file = fs::File::open(&path)?;
-                let image = std::sync::Arc::new(crate::model::FileImage::Mmap(unsafe {
-                    memmap2::Mmap::map(&file)?
-                }));
-                let mut state = format::parse_image(&image, path.parent())?;
-                state.read_only = mode == OpenMode::Read;
-                state
+                if mode == OpenMode::ReadWrite {
+                    open_appendable(&path)?
+                } else {
+                    // memory-map the file: the OS pages data in on demand and
+                    // lazily-referenced datasets avoid up-front copies entirely
+                    // (WASI has no mmap: read the file into an owned buffer instead)
+                    let file = fs::File::open(&path)?;
+                    let image = std::sync::Arc::new(match unsafe { memmap2::Mmap::map(&file) } {
+                        Ok(m) => crate::model::FileImage::Mmap(m),
+                        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                            crate::model::FileImage::Bytes(fs::read(&path)?)
+                        }
+                        Err(e) => return Err(e.into()),
+                    });
+                    // read-only, objects are parsed as they are reached: opening a
+                    // file costs its root, however many objects it holds
+                    let source = crate::format::source::ImageSource::new(image.clone());
+                    let mut state = format::reader::parse_source_lazy(
+                        std::sync::Arc::new(source),
+                        path.parent(),
+                    )?;
+                    state.read_only = true;
+                    state
+                }
             }
             OpenMode::Create => {
                 let mut state = FileState::new_empty();
@@ -426,10 +583,7 @@ impl FileBuilder {
             }
             OpenMode::Append => {
                 if exists {
-                    let bytes = fs::read(&path)?;
-                    let mut state = format::parse_at(&bytes, path.parent())?;
-                    state.read_only = false;
-                    state
+                    open_appendable(&path)?
                 } else {
                     FileState::new_empty()
                 }
@@ -439,22 +593,57 @@ impl FileBuilder {
         let inner = Arc::new(FileInner {
             path: Some(path),
             mode,
-            state: parking_lot::RwLock::new(state),
+            state: crate::lock::RwLock::new(state),
             id: next_id(),
-            externals: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            externals: crate::lock::Mutex::new(std::collections::HashMap::new()),
             #[cfg(feature = "mpi")]
-            mpi: parking_lot::Mutex::new(None),
+            mpi: crate::lock::Mutex::new(None),
         });
 
         // Persist immediately on create so the file exists on disk.
         if matches!(mode, OpenMode::Create | OpenMode::CreateExcl)
             || (mode == OpenMode::Append && !exists)
         {
-            let state = inner.state.read();
-            let bytes = format::serialize(&state)?;
-            fs::write(inner.path.as_ref().unwrap(), bytes)?;
+            let mut state = inner.state.write();
+            let path = inner.path.as_ref().unwrap();
+            fs::write(path, format::serialize(&state)?)?;
+            // from here on, flushes append to it
+            state.appendable = Some(Arc::new(crate::format::source::FileSource::open(path)?));
         }
 
         Ok(File::from_handle(Handle::new(Payload::File(inner))))
     }
+}
+
+/// Open `path` for writing: parsed through a [`FileSource`] that later flushes
+/// append to, so data already in the file is never loaded or rewritten.
+///
+/// [`FileSource`]: crate::format::source::FileSource
+fn open_appendable(path: &Path) -> Result<FileState> {
+    let file = Arc::new(crate::format::source::FileSource::open(path)?);
+    let mut state = format::reader::parse_source(file.clone(), path.parent(), 0)?;
+    state.read_only = false;
+    state.appendable = Some(file);
+    Ok(state)
+}
+
+/// Write a file's changes to `path`: appended to it where possible (see
+/// [`format::flush_append`]), else the whole file rewritten.
+fn write_out(state: &mut FileState, path: &Path) -> Result<()> {
+    if !state.dirty {
+        return Ok(());
+    }
+    if format::flush_append(state)? {
+        state.dirty = false;
+        return Ok(());
+    }
+    state.materialize_all()?;
+    let bytes = format::serialize(state)?;
+    let reopen = state.appendable.take().is_some();
+    fs::write(path, bytes)?;
+    if reopen {
+        state.appendable = Some(Arc::new(crate::format::source::FileSource::open(path)?));
+    }
+    state.dirty = false;
+    Ok(())
 }
