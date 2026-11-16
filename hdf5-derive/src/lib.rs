@@ -5,7 +5,6 @@ use std::mem;
 use std::str::FromStr;
 
 use proc_macro2::{Ident, Span, TokenStream};
-use proc_macro_error::{abort, proc_macro_error};
 use quote::{quote, ToTokens};
 use syn::{
     parse_macro_input, AttrStyle, Attribute, Data, DeriveInput, Expr, Fields, Index, LitStr, Type,
@@ -13,12 +12,14 @@ use syn::{
 };
 
 #[proc_macro_derive(H5Type, attributes(hdf5))]
-#[proc_macro_error]
 pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let body = impl_trait(&name, &input.data, &input.attrs, &ty_generics);
+    let body = match impl_trait(&name, &input.data, &input.attrs, &ty_generics) {
+        Ok(body) => body,
+        Err(err) => return err.to_compile_error().into(),
+    };
     let expanded = quote! {
         #[allow(dead_code, unused_variables, unused_attributes)]
         const _: () = {
@@ -34,6 +35,12 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         };
     };
     proc_macro::TokenStream::from(expanded)
+}
+
+macro_rules! abort {
+    ($tokens:expr, $msg:expr) => {
+        return Err(syn::Error::new_spanned($tokens, $msg))
+    };
 }
 
 fn impl_compound<F>(
@@ -113,8 +120,9 @@ fn is_phantom_data(ty: &Type) -> bool {
     }
 }
 
-fn find_repr(attrs: &[Attribute], expected: &[&str]) -> Option<Ident> {
+fn find_repr(attrs: &[Attribute], expected: &[&str]) -> syn::Result<Option<Ident>> {
     let mut repr = None;
+    let mut ambiguous = None;
     for attr in attrs.iter() {
         if attr.style != AttrStyle::Outer {
             continue;
@@ -125,16 +133,19 @@ fn find_repr(attrs: &[Attribute], expected: &[&str]) -> Option<Ident> {
         attr.parse_nested_meta(|meta| {
             if expected.iter().any(|s| meta.path.is_ident(s)) {
                 if repr.is_some() {
-                    abort!(meta.path, "ambiguous repr attribute");
+                    ambiguous = Some(meta.path.clone());
                 } else {
                     repr = meta.path.get_ident().cloned();
                 }
             }
             Ok(())
         })
-        .ok()?;
+        .ok();
+        if let Some(path) = ambiguous {
+            abort!(path, "ambiguous repr attribute");
+        }
     }
-    repr
+    Ok(repr)
 }
 
 fn find_hdf5_rename(attrs: &[Attribute]) -> Option<String> {
@@ -164,8 +175,8 @@ fn impl_trait(
     data: &Data,
     attrs: &[Attribute],
     ty_generics: &TypeGenerics,
-) -> TokenStream {
-    match *data {
+) -> syn::Result<TokenStream> {
+    Ok(match *data {
         Data::Struct(ref data) => match data.fields {
             Fields::Unit => {
                 abort!(ty, "cannot derive `H5Type` for unit structs");
@@ -180,11 +191,12 @@ fn impl_trait(
                     abort!(ty, "cannot derive `H5Type` for empty structs");
                 }
 
-                let repr =
-                    find_repr(attrs, &["C", "packed", "transparent"]).unwrap_or_else(|| {
-                        abort!(ty,
-                    "`H5Type` requires repr(C), repr(packed) or repr(transparent) for structs")
-                    });
+                let Some(repr) = find_repr(attrs, &["C", "packed", "transparent"])? else {
+                    abort!(
+                        ty,
+                        "`H5Type` requires repr(C), repr(packed) or repr(transparent) for structs"
+                    );
+                };
                 if repr == "transparent" {
                     assert_eq!(fields.len(), 1);
                     impl_transparent(&fields[0].ty)
@@ -210,10 +222,12 @@ fn impl_trait(
                     abort!(ty, "cannot derive `H5Type` for empty tuple structs")
                 }
 
-                let repr =  find_repr(attrs, &["C", "packed", "transparent"]).unwrap_or_else(|| {
-                        abort!(ty,
-                    "`H5Type` requires repr(C), repr(packed) or repr(transparent) for tuple structs")
-                    });
+                let Some(repr) = find_repr(attrs, &["C", "packed", "transparent"])? else {
+                    abort!(
+                        ty,
+                        "`H5Type` requires repr(C), repr(packed) or repr(transparent) for tuple structs"
+                    );
+                };
                 if repr == "transparent" {
                     assert_eq!(fields.len(), 1);
                     impl_transparent(&fields[0].ty)
@@ -248,12 +262,12 @@ fn impl_trait(
             let enum_reprs = &[
                 "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize",
             ];
-            let repr = find_repr(attrs, enum_reprs).unwrap_or_else(|| {
+            let Some(repr) = find_repr(attrs, enum_reprs)? else {
                 abort!(
                     ty,
                     "`H5Type` can only be derived for enums with explicit representation"
-                )
-            });
+                );
+            };
             let names = variants
                 .iter()
                 .map(|v| find_hdf5_rename(&v.attrs).unwrap_or_else(|| v.ident.to_string()))
@@ -264,5 +278,5 @@ fn impl_trait(
         Data::Union(_) => {
             abort!(ty, "cannot derive `H5Type` for tagged unions");
         }
-    }
+    })
 }
